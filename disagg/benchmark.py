@@ -91,6 +91,12 @@ def disagg_completion(prompt: str, n_predict: int = 50, session_id: str = "test"
     
     total_start = time.perf_counter()
     
+    # Step 0: Clear decode server slot first to make room
+    try:
+        requests.post(f"{DECODE_SERVER}/slots/0?action=erase", timeout=10)
+    except:
+        pass
+    
     # Step 1: Prefill only (n_predict=0)
     prefill_start = time.perf_counter()
     response = requests.post(
@@ -124,6 +130,8 @@ def disagg_completion(prompt: str, n_predict: int = 50, session_id: str = "test"
         raise Exception(f"Save request failed: {response.text}")
     
     save_data = response.json()
+    n_saved = save_data.get("n_saved", 0)
+    print(f"    [DEBUG] Saved {n_saved} tokens to {filename}")
     
     # Step 3: Restore on decode server
     restore_start = time.perf_counter()
@@ -135,6 +143,15 @@ def disagg_completion(prompt: str, n_predict: int = 50, session_id: str = "test"
     restore_ms = (time.perf_counter() - restore_start) * 1000
     
     if response.status_code != 200:
+        # Debug: check if file exists and server config
+        print(f"    [DEBUG] Restore failed. Checking configs...")
+        try:
+            prefill_props = requests.get(f"{PREFILL_SERVER}/props", timeout=5).json()
+            decode_props = requests.get(f"{DECODE_SERVER}/props", timeout=5).json()
+            print(f"    [DEBUG] Prefill n_ctx: {prefill_props.get('default_generation_settings', {}).get('n_ctx', 'unknown')}")
+            print(f"    [DEBUG] Decode n_ctx: {decode_props.get('default_generation_settings', {}).get('n_ctx', 'unknown')}")
+        except Exception as e:
+            print(f"    [DEBUG] Could not get props: {e}")
         raise Exception(f"Restore request failed: {response.text}")
     
     # Step 4: Generate tokens (should skip prefill due to restored cache)
