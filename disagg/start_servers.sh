@@ -5,27 +5,82 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_DIR="$(dirname "$SCRIPT_DIR")"
-SERVER_BIN="$LLAMA_DIR/build/bin/llama-server"
+
+# Try to find llama-server in common locations
+SERVER_BIN=""
+for path in \
+    "$LLAMA_DIR/build/bin/llama-server" \
+    "$LLAMA_DIR/build/llama-server" \
+    "$(which llama-server 2>/dev/null)" \
+    "/usr/local/bin/llama-server" \
+    "$HOME/.local/bin/llama-server"
+do
+    if [ -x "$path" ]; then
+        SERVER_BIN="$path"
+        break
+    fi
+done
 
 # Check arguments
 if [ -z "$1" ]; then
-    echo "Usage: $0 <model_path> [context_size]"
-    echo "Example: $0 /path/to/model.gguf 8192"
+    echo "Usage: $0 <model_path> [context_size] [mode]"
+    echo ""
+    echo "Arguments:"
+    echo "  model_path    Path to GGUF model file"
+    echo "  context_size  Context size (default: 8192)"
+    echo "  mode          'dual' for dual GPU, 'single' for single GPU (default: auto-detect)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 /path/to/model.gguf 8192 dual    # Dual GPU setup"
+    echo "  $0 /path/to/model.gguf 8192 single  # Single GPU (or Metal)"
     exit 1
 fi
 
 MODEL_PATH="$1"
 CTX_SIZE="${2:-8192}"
+MODE="${3:-auto}"
 
-# Create shared KV cache directory (using tmpfs for speed if available)
+# Create shared KV cache directory
 KV_CACHE_DIR="/tmp/llama_kv_cache"
 mkdir -p "$KV_CACHE_DIR"
 
 # Check if server binary exists
-if [ ! -f "$SERVER_BIN" ]; then
-    echo "Error: llama-server not found at $SERVER_BIN"
-    echo "Run ./disagg/build.sh first"
+if [ -z "$SERVER_BIN" ]; then
+    echo "Error: llama-server not found!"
+    echo "Searched in:"
+    echo "  - $LLAMA_DIR/build/bin/llama-server"
+    echo "  - $LLAMA_DIR/build/llama-server"
+    echo "  - PATH"
+    echo ""
+    echo "Please either:"
+    echo "  1. Run ./disagg/build.sh to build"
+    echo "  2. Set SERVER_BIN environment variable"
+    echo "  3. Add llama-server to your PATH"
     exit 1
+fi
+
+echo "Using llama-server: $SERVER_BIN"
+
+# Auto-detect GPU mode
+if [ "$MODE" = "auto" ]; then
+    # Check for NVIDIA GPUs
+    if command -v nvidia-smi &> /dev/null; then
+        GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
+        if [ "$GPU_COUNT" -ge 2 ]; then
+            MODE="dual"
+            echo "Auto-detected: $GPU_COUNT NVIDIA GPUs -> dual mode"
+        else
+            MODE="single"
+            echo "Auto-detected: $GPU_COUNT NVIDIA GPU -> single mode"
+        fi
+    # Check for Metal (macOS)
+    elif system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Metal"; then
+        MODE="single"
+        echo "Auto-detected: Metal GPU -> single mode"
+    else
+        MODE="single"
+        echo "Auto-detected: No multi-GPU found -> single mode"
+    fi
 fi
 
 # Kill any existing servers
@@ -33,45 +88,81 @@ pkill -f "llama-server.*8080" 2>/dev/null || true
 pkill -f "llama-server.*8081" 2>/dev/null || true
 sleep 1
 
+echo ""
 echo "========================================"
 echo "Starting Disaggregated Prefill Servers"
 echo "========================================"
+echo "Mode: $MODE"
 echo "Model: $MODEL_PATH"
 echo "Context size: $CTX_SIZE"
 echo "KV cache dir: $KV_CACHE_DIR"
 echo ""
 
-# Start Prefill Server (GPU 0, port 8080)
-echo "Starting Prefill Server on port 8080 (GPU 0)..."
-$SERVER_BIN \
-    -m "$MODEL_PATH" \
-    --port 8080 \
-    --host 0.0.0.0 \
-    -c "$CTX_SIZE" \
-    --slot-save-path "$KV_CACHE_DIR/" \
-    -np 1 \
-    --metrics \
-    -dev cuda0 \
-    2>&1 | sed 's/^/[PREFILL] /' &
-PREFILL_PID=$!
+if [ "$MODE" = "dual" ]; then
+    # DUAL GPU MODE: Each server on separate GPU
+    
+    echo "Starting Prefill Server on port 8080 (GPU 0)..."
+    $SERVER_BIN \
+        -m "$MODEL_PATH" \
+        --port 8080 \
+        --host 0.0.0.0 \
+        -c "$CTX_SIZE" \
+        --slot-save-path "$KV_CACHE_DIR/" \
+        -np 1 \
+        --metrics \
+        -dev cuda0 \
+        2>&1 | sed 's/^/[PREFILL] /' &
+    PREFILL_PID=$!
 
-# Start Decode Server (GPU 1, port 8081)
-echo "Starting Decode Server on port 8081 (GPU 1)..."
-$SERVER_BIN \
-    -m "$MODEL_PATH" \
-    --port 8081 \
-    --host 0.0.0.0 \
-    -c "$CTX_SIZE" \
-    --slot-save-path "$KV_CACHE_DIR/" \
-    -np 4 \
-    --metrics \
-    -dev cuda1 \
-    2>&1 | sed 's/^/[DECODE]  /' &
-DECODE_PID=$!
+    echo "Starting Decode Server on port 8081 (GPU 1)..."
+    $SERVER_BIN \
+        -m "$MODEL_PATH" \
+        --port 8081 \
+        --host 0.0.0.0 \
+        -c "$CTX_SIZE" \
+        --slot-save-path "$KV_CACHE_DIR/" \
+        -np 4 \
+        --metrics \
+        -dev cuda1 \
+        2>&1 | sed 's/^/[DECODE]  /' &
+    DECODE_PID=$!
+    
+else
+    # SINGLE GPU MODE: Both servers on same GPU (different ports)
+    # This still tests the architecture, just without GPU parallelism
+    
+    echo "Starting Prefill Server on port 8080..."
+    $SERVER_BIN \
+        -m "$MODEL_PATH" \
+        --port 8080 \
+        --host 0.0.0.0 \
+        -c "$CTX_SIZE" \
+        --slot-save-path "$KV_CACHE_DIR/" \
+        -np 1 \
+        --metrics \
+        2>&1 | sed 's/^/[PREFILL] /' &
+    PREFILL_PID=$!
+
+    # Wait for first server to load model before starting second
+    echo "Waiting for prefill server to load model..."
+    sleep 10
+
+    echo "Starting Decode Server on port 8081..."
+    $SERVER_BIN \
+        -m "$MODEL_PATH" \
+        --port 8081 \
+        --host 0.0.0.0 \
+        -c "$CTX_SIZE" \
+        --slot-save-path "$KV_CACHE_DIR/" \
+        -np 4 \
+        --metrics \
+        2>&1 | sed 's/^/[DECODE]  /' &
+    DECODE_PID=$!
+fi
 
 echo ""
 echo "Waiting for servers to start..."
-sleep 5
+sleep 10
 
 # Health check
 check_health() {
