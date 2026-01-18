@@ -150,6 +150,17 @@ async def get_server_info() -> Dict[str, Any]:
                         }
             except Exception as e:
                 info[name] = {"error": str(e)}
+        
+        # Check orchestrator
+        try:
+            async with session.get(f"{ORCHESTRATOR_URL}/health") as resp:
+                if resp.status == 200:
+                    info["orchestrator"] = {"status": "healthy"}
+                else:
+                    info["orchestrator"] = {"error": f"HTTP {resp.status}"}
+        except Exception as e:
+            info["orchestrator"] = {"error": str(e)}
+    
     return info
 
 
@@ -297,6 +308,13 @@ def aggregate_results(
     """Aggregate individual request results"""
     successful = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
+    
+    # Print errors for debugging
+    if failed and not successful:
+        print(f"    ⚠ All {len(failed)} requests failed!")
+        errors = set(r.get("error", "unknown") for r in failed[:3])
+        for err in errors:
+            print(f"      Error: {err[:100]}")
     
     if not successful:
         return RunResult(
@@ -556,8 +574,20 @@ async def main():
     for name, info in server_info.items():
         if "error" in info:
             print(f"  ✗ {name}: {info['error']}")
+        elif name == "orchestrator":
+            print(f"  ✓ {name}: {info.get('status', 'unknown')}")
         else:
             print(f"  ✓ {name}: n_ctx={info.get('n_ctx')}, slots={info.get('total_slots')}")
+    
+    # Warn if orchestrator not available
+    if "orchestrator" in server_info and "error" in server_info["orchestrator"]:
+        print("\n  ⚠ WARNING: Orchestrator not running! Disaggregated tests will fail.")
+        print("    Start it with: python3 disagg/smart_orchestrator.py --port 9000")
+        if not args.baseline_only:
+            response = input("\n  Continue with baseline only? [Y/n]: ").strip().lower()
+            if response != 'n':
+                args.baseline_only = True
+                args.disagg_only = False
     
     # Run sweep
     all_results = []
