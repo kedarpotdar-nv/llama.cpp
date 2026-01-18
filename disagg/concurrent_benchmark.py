@@ -37,6 +37,9 @@ class RequestResult:
     cache_n: int = 0
     prompt_n: int = 0
     tokens_generated: int = 0
+    tokens_evaluated: int = 0  # Prompt tokens processed
+    prompt_tps: float = 0      # Prompt processing tokens/sec
+    decode_tps: float = 0      # Decode tokens/sec
     error: str = ""
 
 
@@ -61,6 +64,15 @@ class BenchmarkResult:
     # Throughput
     requests_per_sec: float = 0
     tokens_per_sec: float = 0
+    
+    # TPS metrics (server-reported)
+    avg_prompt_tps: float = 0   # Avg prompt processing TPS
+    avg_decode_tps: float = 0   # Avg decode TPS
+    
+    # Phase timing breakdown (for disagg)
+    avg_prefill_ms: float = 0
+    avg_transfer_ms: float = 0
+    avg_decode_ms: float = 0
     
     # Cache stats (for disagg)
     avg_cache_n: float = 0
@@ -150,8 +162,12 @@ async def make_baseline_request(
                 total_time_ms=(t_end - t_start) * 1000,
                 prefill_time_ms=timings.get("prompt_ms", 0),
                 decode_time_ms=timings.get("predicted_ms", 0),
-                tokens_generated=result.get("tokens_predicted", 0),
+                tokens_generated=timings.get("predicted_n", 0),
+                tokens_evaluated=timings.get("prompt_n", 0),
                 prompt_n=timings.get("prompt_n", 0),
+                cache_n=timings.get("cache_n", 0),
+                prompt_tps=timings.get("prompt_per_second", 0),
+                decode_tps=timings.get("predicted_per_second", 0),
             )
     
     except Exception as e:
@@ -197,6 +213,7 @@ async def make_disagg_request(
             t_end = time.perf_counter()
             
             metrics = result.get("disagg_metrics", {})
+            timings = result.get("timings", {})
             
             return RequestResult(
                 request_id=request_id,
@@ -207,7 +224,10 @@ async def make_disagg_request(
                 decode_time_ms=metrics.get("decode_time_ms", 0),
                 cache_n=metrics.get("cache_n", 0),
                 prompt_n=metrics.get("prompt_n", 0),
-                tokens_generated=metrics.get("n_generated_tokens", 0),
+                tokens_evaluated=metrics.get("tokens_evaluated", 0),
+                tokens_generated=metrics.get("n_generated_tokens", timings.get("predicted_n", 0)),
+                prompt_tps=timings.get("prompt_per_second", 0),
+                decode_tps=timings.get("predicted_per_second", 0),
             )
     
     except Exception as e:
@@ -290,6 +310,18 @@ async def run_benchmark(
         result.requests_per_sec = len(successful) / result.total_time_sec
         result.tokens_per_sec = total_tokens / result.total_time_sec
         
+        # TPS metrics (server-reported averages)
+        prompt_tps_values = [r.prompt_tps for r in successful if r.prompt_tps > 0]
+        decode_tps_values = [r.decode_tps for r in successful if r.decode_tps > 0]
+        result.avg_prompt_tps = statistics.mean(prompt_tps_values) if prompt_tps_values else 0
+        result.avg_decode_tps = statistics.mean(decode_tps_values) if decode_tps_values else 0
+        
+        # Phase timing breakdown
+        result.avg_prefill_ms = statistics.mean([r.prefill_time_ms for r in successful])
+        result.avg_decode_ms = statistics.mean([r.decode_time_ms for r in successful])
+        if mode == "disagg":
+            result.avg_transfer_ms = statistics.mean([r.transfer_time_ms for r in successful])
+        
         # Cache stats (disagg only)
         if mode == "disagg":
             cache_ns = [r.cache_n for r in successful]
@@ -313,7 +345,7 @@ def print_results(baseline: BenchmarkResult, disagg: BenchmarkResult):
     print(f"  Output tokens:  {baseline.output_tokens}")
     
     print("\n" + "-"*80)
-    print(f"{'Metric':<30} {'Baseline':>20} {'Disaggregated':>20}")
+    print(f"{'Metric':<35} {'Baseline':>18} {'Disaggregated':>18}")
     print("-"*80)
     
     def fmt(val, unit=""):
@@ -321,21 +353,42 @@ def print_results(baseline: BenchmarkResult, disagg: BenchmarkResult):
             return f"{val:.1f}{unit}"
         return f"{val}{unit}"
     
-    print(f"{'Total Time':<30} {fmt(baseline.total_time_sec, 's'):>20} {fmt(disagg.total_time_sec, 's'):>20}")
-    print(f"{'Success/Fail':<30} {f'{baseline.success_count}/{baseline.failure_count}':>20} {f'{disagg.success_count}/{disagg.failure_count}':>20}")
+    print(f"{'Total Time':<35} {fmt(baseline.total_time_sec, 's'):>18} {fmt(disagg.total_time_sec, 's'):>18}")
+    print(f"{'Success/Fail':<35} {f'{baseline.success_count}/{baseline.failure_count}':>18} {f'{disagg.success_count}/{disagg.failure_count}':>18}")
     print()
-    print(f"{'Avg Latency':<30} {fmt(baseline.avg_latency_ms, 'ms'):>20} {fmt(disagg.avg_latency_ms, 'ms'):>20}")
-    print(f"{'P50 Latency':<30} {fmt(baseline.p50_latency_ms, 'ms'):>20} {fmt(disagg.p50_latency_ms, 'ms'):>20}")
-    print(f"{'P90 Latency':<30} {fmt(baseline.p90_latency_ms, 'ms'):>20} {fmt(disagg.p90_latency_ms, 'ms'):>20}")
-    print(f"{'P99 Latency':<30} {fmt(baseline.p99_latency_ms, 'ms'):>20} {fmt(disagg.p99_latency_ms, 'ms'):>20}")
-    print(f"{'Min Latency':<30} {fmt(baseline.min_latency_ms, 'ms'):>20} {fmt(disagg.min_latency_ms, 'ms'):>20}")
-    print(f"{'Max Latency':<30} {fmt(baseline.max_latency_ms, 'ms'):>20} {fmt(disagg.max_latency_ms, 'ms'):>20}")
+    
+    # Latency section
+    print("LATENCY:")
+    print(f"{'  Avg Latency':<35} {fmt(baseline.avg_latency_ms, 'ms'):>18} {fmt(disagg.avg_latency_ms, 'ms'):>18}")
+    print(f"{'  P50 Latency':<35} {fmt(baseline.p50_latency_ms, 'ms'):>18} {fmt(disagg.p50_latency_ms, 'ms'):>18}")
+    print(f"{'  P90 Latency':<35} {fmt(baseline.p90_latency_ms, 'ms'):>18} {fmt(disagg.p90_latency_ms, 'ms'):>18}")
+    print(f"{'  P99 Latency':<35} {fmt(baseline.p99_latency_ms, 'ms'):>18} {fmt(disagg.p99_latency_ms, 'ms'):>18}")
     print()
-    print(f"{'Requests/sec':<30} {fmt(baseline.requests_per_sec):>20} {fmt(disagg.requests_per_sec):>20}")
-    print(f"{'Tokens/sec':<30} {fmt(baseline.tokens_per_sec):>20} {fmt(disagg.tokens_per_sec):>20}")
+    
+    # Phase breakdown
+    print("PHASE BREAKDOWN (avg):")
+    print(f"{'  Prefill time':<35} {fmt(baseline.avg_prefill_ms, 'ms'):>18} {fmt(disagg.avg_prefill_ms, 'ms'):>18}")
+    if disagg.avg_transfer_ms > 0:
+        print(f"{'  Transfer time (save+restore)':<35} {'-':>18} {fmt(disagg.avg_transfer_ms, 'ms'):>18}")
+    print(f"{'  Decode time':<35} {fmt(baseline.avg_decode_ms, 'ms'):>18} {fmt(disagg.avg_decode_ms, 'ms'):>18}")
     print()
-    print(f"{'Avg Cache Reuse (disagg)':<30} {'-':>20} {fmt(disagg.avg_cache_n, ' tokens'):>20}")
-    print(f"{'Cache Hit Rate (disagg)':<30} {'-':>20} {fmt(disagg.cache_hit_rate * 100, '%'):>20}")
+    
+    # TPS metrics
+    print("TOKENS/SEC (server-reported):")
+    print(f"{'  Prompt processing TPS':<35} {fmt(baseline.avg_prompt_tps, ' t/s'):>18} {fmt(disagg.avg_prompt_tps, ' t/s'):>18}")
+    print(f"{'  Decode TPS':<35} {fmt(baseline.avg_decode_tps, ' t/s'):>18} {fmt(disagg.avg_decode_tps, ' t/s'):>18}")
+    print()
+    
+    # Throughput
+    print("THROUGHPUT:")
+    print(f"{'  Requests/sec':<35} {fmt(baseline.requests_per_sec):>18} {fmt(disagg.requests_per_sec):>18}")
+    print(f"{'  Output tokens/sec':<35} {fmt(baseline.tokens_per_sec):>18} {fmt(disagg.tokens_per_sec):>18}")
+    print()
+    
+    # Cache stats
+    print("CACHE (disagg only):")
+    print(f"{'  Avg Cache Reuse':<35} {'-':>18} {fmt(disagg.avg_cache_n, ' tokens'):>18}")
+    print(f"{'  Cache Hit Rate':<35} {'-':>18} {fmt(disagg.cache_hit_rate * 100, '%'):>18}")
     
     print("\n" + "-"*80)
     

@@ -366,9 +366,10 @@ class SmartOrchestrator:
             "decode_time_ms": decode_time_ms,
             "total_time_ms": session.prefill_time_ms + session.transfer_time_ms + decode_time_ms,
             "n_prompt_tokens": session.n_tokens,
+            "tokens_evaluated": session.n_tokens,  # Same as n_prompt_tokens for consistency
             "n_generated_tokens": generated_tokens,
             "cache_n": cache_n,  # Tokens reused from cache
-            "prompt_n": prompt_n,  # Tokens processed
+            "prompt_n": prompt_n,  # Tokens processed (should be 0 if cache hit)
         }
         
         cache_status = "✓ CACHE HIT" if cache_n > 0 else "✗ cache miss"
