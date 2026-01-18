@@ -82,9 +82,10 @@ class ServerConfig:
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
     # Slot counts - MUST match server -np settings
+    # Check with: curl -s http://localhost:8080/props | grep total_slots
     # IMPORTANT: Both servers must have SAME slot count for KV cache compatibility
-    prefill_slots: int = 2  # Prefill server slots (default: 2 for lower VRAM)
-    decode_slots: int = 2   # Decode server slots (same as prefill!)
+    prefill_slots: int = 2  # Update to match your server's -np setting
+    decode_slots: int = 2   # Must be same as prefill_slots
 
 
 class SlotManager:
@@ -597,14 +598,18 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def on_startup(app: web.Application):
+    n_slots = app.get("n_slots", 2)
     config = ServerConfig(
         prefill_url=app["prefill_url"],
         decode_url=app["decode_url"],
+        prefill_slots=n_slots,
+        decode_slots=n_slots,
     )
     app["orchestrator"] = SmartOrchestrator(config)
     logger.info(f"Smart Orchestrator started")
     logger.info(f"  Prefill: {config.prefill_url}")
     logger.info(f"  Decode:  {config.decode_url}")
+    logger.info(f"  Slots:   {n_slots} (max concurrency)")
 
 
 async def on_cleanup(app: web.Application):
@@ -613,10 +618,11 @@ async def on_cleanup(app: web.Application):
         await orchestrator.close()
 
 
-def create_app(prefill_url: str, decode_url: str) -> web.Application:
+def create_app(prefill_url: str, decode_url: str, n_slots: int = 2) -> web.Application:
     app = web.Application()
     app["prefill_url"] = prefill_url
     app["decode_url"] = decode_url
+    app["n_slots"] = n_slots
     
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
@@ -636,6 +642,8 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--prefill-url", type=str, default="http://localhost:8080")
     parser.add_argument("--decode-url", type=str, default="http://localhost:8081")
+    parser.add_argument("--slots", type=int, default=2,
+                        help="Number of slots per server (must match server -np setting)")
     
     args = parser.parse_args()
     
@@ -648,9 +656,10 @@ def main():
 ╚═══════════════════════════════════════════════════════════╝
     """)
     
-    app = create_app(args.prefill_url, args.decode_url)
+    app = create_app(args.prefill_url, args.decode_url, args.slots)
     
     logger.info(f"Starting on {args.host}:{args.port}")
+    logger.info(f"Slots: {args.slots} (max concurrency = slots)")
     logger.info("")
     logger.info("Endpoints:")
     logger.info(f"  POST /completion     - Disaggregated completion")

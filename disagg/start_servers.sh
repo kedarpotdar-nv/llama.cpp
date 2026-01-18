@@ -30,9 +30,14 @@ if [ -z "$1" ]; then
     echo "  context_size  Context size (default: 8192)"
     echo "  mode          'dual' for dual GPU, 'single' for single GPU (default: auto-detect)"
     echo ""
+    echo "Environment variables:"
+    echo "  N_SLOTS       Number of slots per server (default: 2 for dual, 1 for single)"
+    echo "                IMPORTANT: Both servers MUST have same ctx and slots for KV cache compatibility"
+    echo ""
     echo "Examples:"
-    echo "  $0 /path/to/model.gguf 8192 dual    # Dual GPU setup"
-    echo "  $0 /path/to/model.gguf 8192 single  # Single GPU (or Metal)"
+    echo "  $0 /path/to/model.gguf 2048 dual           # Dual GPU, 2 slots each"
+    echo "  N_SLOTS=4 $0 /path/to/model.gguf 4096 dual # Dual GPU, 4 slots each"
+    echo "  $0 /path/to/model.gguf 2048 single         # Single GPU"
     exit 1
 fi
 
@@ -113,6 +118,8 @@ if [ "$MODE" = "dual" ]; then
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
+        -cb \
+        -fa \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
@@ -126,6 +133,8 @@ if [ "$MODE" = "dual" ]; then
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
+        -cb \
+        -fa \
         --metrics \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!
@@ -133,10 +142,11 @@ if [ "$MODE" = "dual" ]; then
 else
     # SINGLE GPU MODE: Both servers on same GPU (different ports)
     # This still tests the architecture, just without GPU parallelism
-    # Prefill: 1 slot (limited VRAM on single GPU)
-    # Decode: 4 slots 
+    # IMPORTANT: Both servers MUST have same ctx and slots for KV cache compatibility
     
-    echo "Starting Prefill Server on port 8080 (1 slot)..."
+    N_SLOTS="${N_SLOTS:-1}"  # Default 1 for single GPU (lower VRAM)
+    
+    echo "Starting Prefill Server on port 8080 ($N_SLOTS slots, ctx=$CTX_SIZE)..."
     $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8080 \
@@ -144,7 +154,9 @@ else
         -c "$CTX_SIZE" \
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 1 \
+        -np $N_SLOTS \
+        -cb \
+        -fa \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
@@ -153,7 +165,7 @@ else
     echo "Waiting for prefill server to load model..."
     sleep 15
 
-    echo "Starting Decode Server on port 8081 (4 slots)..."
+    echo "Starting Decode Server on port 8081 ($N_SLOTS slots, ctx=$CTX_SIZE)..."
     $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8081 \
@@ -161,7 +173,9 @@ else
         -c "$CTX_SIZE" \
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 4 \
+        -np $N_SLOTS \
+        -cb \
+        -fa \
         --metrics \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!
@@ -186,6 +200,26 @@ check_health() {
 
 check_health 8080 "Prefill" || exit 1
 check_health 8081 "Decode" || exit 1
+
+# Verify both servers have matching configurations (critical for KV cache compatibility)
+echo ""
+echo "Verifying server configurations..."
+PREFILL_CTX=$(curl -s http://localhost:8080/props | grep -o '"n_ctx":[0-9]*' | cut -d: -f2)
+DECODE_CTX=$(curl -s http://localhost:8081/props | grep -o '"n_ctx":[0-9]*' | cut -d: -f2)
+PREFILL_SLOTS=$(curl -s http://localhost:8080/props | grep -o '"total_slots":[0-9]*' | cut -d: -f2)
+DECODE_SLOTS=$(curl -s http://localhost:8081/props | grep -o '"total_slots":[0-9]*' | cut -d: -f2)
+
+echo "  Prefill: n_ctx=$PREFILL_CTX, slots=$PREFILL_SLOTS"
+echo "  Decode:  n_ctx=$DECODE_CTX, slots=$DECODE_SLOTS"
+
+if [ "$PREFILL_CTX" != "$DECODE_CTX" ] || [ "$PREFILL_SLOTS" != "$DECODE_SLOTS" ]; then
+    echo ""
+    echo "⚠️  WARNING: Server configurations don't match!"
+    echo "   KV cache transfer will FAIL with mismatched ctx or slots."
+    echo "   Please restart both servers with identical -c and -np settings."
+    exit 1
+fi
+echo "✓ Configurations match - KV cache transfer should work"
 
 echo ""
 echo "========================================"
