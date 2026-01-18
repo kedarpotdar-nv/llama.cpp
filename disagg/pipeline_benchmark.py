@@ -156,7 +156,7 @@ class DisaggPipelineRunner:
         Important: Process in chunks matching prefill server slots to avoid conflicts.
         """
         http = await self.get_http()
-        n_prefill_slots = 4  # Prefill server slots (match -np in start_servers.sh)
+        n_prefill_slots = 2  # Prefill server slots (match -np in start_servers.sh)
         all_results = []
         
         async def prefill_one(req: Dict, slot: int) -> Dict[str, Any]:
@@ -248,7 +248,7 @@ class DisaggPipelineRunner:
     ) -> List[Dict[str, Any]]:
         """Restore KV caches to decode server"""
         http = await self.get_http()
-        n_decode_slots = 8  # Decode server has 8 slots
+        n_decode_slots = 2  # Decode server slots (must match prefill for KV compat)
         
         async def restore_one(idx: int, sr: Dict) -> Dict[str, Any]:
             if "error" in sr:

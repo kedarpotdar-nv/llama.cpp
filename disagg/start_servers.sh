@@ -100,10 +100,11 @@ echo ""
 
 if [ "$MODE" = "dual" ]; then
     # DUAL GPU MODE: Each server on separate GPU
-    # Prefill: 4 slots (handles long prompts, better batch throughput)
-    # Decode: 8 slots (many concurrent short generations)
+    # IMPORTANT: Both servers MUST have same -np for KV cache compatibility
     
-    echo "Starting Prefill Server on port 8080 (GPU 0, 4 slots)..."
+    N_SLOTS="${N_SLOTS:-2}"  # Default 2, can override with N_SLOTS=4 ./start_servers.sh ...
+    
+    echo "Starting Prefill Server on port 8080 (GPU 0, $N_SLOTS slots, ctx=$CTX_SIZE)..."
     CUDA_VISIBLE_DEVICES=0 $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8080 \
@@ -111,12 +112,12 @@ if [ "$MODE" = "dual" ]; then
         -c "$CTX_SIZE" \
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 4 \
+        -np $N_SLOTS \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
 
-    echo "Starting Decode Server on port 8081 (GPU 1, 8 slots)..."
+    echo "Starting Decode Server on port 8081 (GPU 1, $N_SLOTS slots, ctx=$CTX_SIZE)..."
     CUDA_VISIBLE_DEVICES=1 $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8081 \
@@ -124,7 +125,7 @@ if [ "$MODE" = "dual" ]; then
         -c "$CTX_SIZE" \
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 8 \
+        -np $N_SLOTS \
         --metrics \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!

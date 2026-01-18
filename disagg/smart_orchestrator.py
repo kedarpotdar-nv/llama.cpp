@@ -81,9 +81,10 @@ class ServerConfig:
     decode_url: str = "http://localhost:8081"
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
-    # Slot counts - should match server -np settings
-    prefill_slots: int = 4  # Prefill server slots (dual GPU mode)
-    decode_slots: int = 8   # Decode server slots
+    # Slot counts - MUST match server -np settings
+    # IMPORTANT: Both servers must have SAME slot count for KV cache compatibility
+    prefill_slots: int = 2  # Prefill server slots (default: 2 for lower VRAM)
+    decode_slots: int = 2   # Decode server slots (same as prefill!)
 
 
 class SlotManager:
