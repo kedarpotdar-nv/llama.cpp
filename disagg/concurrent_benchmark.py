@@ -23,6 +23,8 @@ import aiohttp
 # Configuration
 ORCHESTRATOR_URL = "http://localhost:9000"
 BASELINE_URL = "http://localhost:8080"  # Direct to prefill server for baseline
+PREFILL_URL = "http://localhost:8080"
+DECODE_URL = "http://localhost:8081"
 
 
 @dataclass
