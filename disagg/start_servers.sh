@@ -100,43 +100,48 @@ echo ""
 
 if [ "$MODE" = "dual" ]; then
     # DUAL GPU MODE: Each server on separate GPU
+    # Prefill: 2 slots (handles long prompts, continuous batching)
+    # Decode: 8 slots (many concurrent short generations)
     
-    echo "Starting Prefill Server on port 8080 (GPU 0)..."
-    $SERVER_BIN \
+    echo "Starting Prefill Server on port 8080 (GPU 0, 2 slots)..."
+    CUDA_VISIBLE_DEVICES=0 $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8080 \
         --host 0.0.0.0 \
         -c "$CTX_SIZE" \
+        -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 1 \
+        -np 2 \
         --metrics \
-        -dev cuda0 \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
 
-    echo "Starting Decode Server on port 8081 (GPU 1)..."
-    $SERVER_BIN \
+    echo "Starting Decode Server on port 8081 (GPU 1, 8 slots)..."
+    CUDA_VISIBLE_DEVICES=1 $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8081 \
         --host 0.0.0.0 \
         -c "$CTX_SIZE" \
+        -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 4 \
+        -np 8 \
         --metrics \
-        -dev cuda1 \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!
     
 else
     # SINGLE GPU MODE: Both servers on same GPU (different ports)
     # This still tests the architecture, just without GPU parallelism
+    # Prefill: 1 slot (limited VRAM on single GPU)
+    # Decode: 4 slots 
     
-    echo "Starting Prefill Server on port 8080..."
+    echo "Starting Prefill Server on port 8080 (1 slot)..."
     $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8080 \
         --host 0.0.0.0 \
         -c "$CTX_SIZE" \
+        -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
         -np 1 \
         --metrics \
@@ -145,14 +150,15 @@ else
 
     # Wait for first server to load model before starting second
     echo "Waiting for prefill server to load model..."
-    sleep 10
+    sleep 15
 
-    echo "Starting Decode Server on port 8081..."
+    echo "Starting Decode Server on port 8081 (4 slots)..."
     $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8081 \
         --host 0.0.0.0 \
         -c "$CTX_SIZE" \
+        -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
         -np 4 \
         --metrics \

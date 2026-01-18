@@ -76,10 +76,9 @@ class ServerConfig:
     decode_url: str = "http://localhost:8081"
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
-    # Slot counts (should match server -np settings)
-    # These are tracked by orchestrator; actual server slots set via -np
-    prefill_slots: int = 4
-    decode_slots: int = 4
+    # Decode slots tracked by orchestrator - should match decode server's -np
+    # (prefill slots no longer tracked - server handles its own batching)
+    decode_slots: int = 8
 
 
 class SlotManager:
@@ -154,7 +153,6 @@ class SmartOrchestrator:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.sessions: Dict[str, Session] = {}
-        self.prefill_slots = SlotManager(config.prefill_slots)
         self.decode_slots = SlotManager(config.decode_slots)
         self._session: Optional[aiohttp.ClientSession] = None
         
