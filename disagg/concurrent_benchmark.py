@@ -423,6 +423,36 @@ def print_results(baseline: BenchmarkResult, disagg: BenchmarkResult):
     print("="*80)
 
 
+async def clear_all_slots():
+    """Clear all slots on both servers and orchestrator sessions"""
+    async with aiohttp.ClientSession() as session:
+        # Clear orchestrator sessions
+        try:
+            async with session.post(f"{ORCHESTRATOR_URL}/clear") as resp:
+                if resp.status == 200:
+                    print("  ✓ Cleared orchestrator sessions")
+        except:
+            pass
+        
+        # Erase slots on prefill server
+        for slot_id in range(8):  # Try up to 8 slots
+            try:
+                async with session.post(f"{PREFILL_URL}/slots/{slot_id}?action=erase") as resp:
+                    pass
+            except:
+                break
+        print("  ✓ Cleared prefill server slots")
+        
+        # Erase slots on decode server
+        for slot_id in range(8):
+            try:
+                async with session.post(f"{DECODE_URL}/slots/{slot_id}?action=erase") as resp:
+                    pass
+            except:
+                break
+        print("  ✓ Cleared decode server slots")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Concurrent Benchmark for Disaggregated Prefill")
     parser.add_argument("--concurrency", "-c", type=int, default=5,
@@ -437,6 +467,8 @@ async def main():
                         help="Only run baseline test")
     parser.add_argument("--disagg-only", action="store_true",
                         help="Only run disaggregated test")
+    parser.add_argument("--no-clear", action="store_true",
+                        help="Skip clearing slots before benchmark")
     
     args = parser.parse_args()
     
@@ -448,6 +480,12 @@ async def main():
 ║  This is where disaggregated prefill should provide benefits.                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
     """)
+    
+    # Clear slots before starting
+    if not args.no_clear:
+        print("Clearing slots and sessions...")
+        await clear_all_slots()
+        print()
     
     # Generate test prompt
     print(f"Generating prompt with ~{args.prompt_tokens} tokens...")

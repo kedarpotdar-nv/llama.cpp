@@ -425,8 +425,9 @@ class DisaggPipelineRunner:
             
             # Continue decode for previous wave (if any)
             if current_wave_data is not None:
+                wave_data = current_wave_data  # Capture for closure
                 async def do_decode():
-                    return await self.decode_batch(current_wave_data, output_tokens)
+                    return await self.decode_batch(wave_data, output_tokens)
                 
                 decode_task = asyncio.create_task(do_decode())
                 tasks_to_run.append(("decode", decode_task))
@@ -694,6 +695,48 @@ def print_results(baseline: PipelineResult, disagg: PipelineResult):
     print("="*80)
 
 
+async def clear_all_slots():
+    """Clear all slots on both servers and delete KV cache files"""
+    async with aiohttp.ClientSession() as session:
+        # Clear orchestrator sessions if running
+        try:
+            async with session.post(f"{ORCHESTRATOR_URL}/clear") as resp:
+                if resp.status == 200:
+                    print("  ✓ Cleared orchestrator sessions")
+        except:
+            pass
+        
+        # Erase slots on prefill server
+        for slot_id in range(8):  # Try up to 8 slots
+            try:
+                async with session.post(f"{PREFILL_URL}/slots/{slot_id}?action=erase") as resp:
+                    pass
+            except:
+                break
+        print("  ✓ Cleared prefill server slots")
+        
+        # Erase slots on decode server  
+        for slot_id in range(8):
+            try:
+                async with session.post(f"{DECODE_URL}/slots/{slot_id}?action=erase") as resp:
+                    pass
+            except:
+                break
+        print("  ✓ Cleared decode server slots")
+    
+    # Also clear KV cache files
+    import glob
+    import os
+    cache_files = glob.glob("/tmp/llama_kv_cache/*.bin")
+    for f in cache_files:
+        try:
+            os.remove(f)
+        except:
+            pass
+    if cache_files:
+        print(f"  ✓ Deleted {len(cache_files)} KV cache files")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Pipeline Benchmark for Disaggregated Prefill")
     parser.add_argument("--waves", "-w", type=int, default=5,
@@ -706,6 +749,8 @@ async def main():
                         help="Tokens to generate (default: 20)")
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--disagg-only", action="store_true")
+    parser.add_argument("--no-clear", action="store_true",
+                        help="Skip clearing slots before benchmark")
     
     args = parser.parse_args()
     
@@ -720,6 +765,12 @@ async def main():
     
     print(f"Configuration: {args.waves} waves × {args.batch_size} requests = {args.waves * args.batch_size} total")
     print(f"Prompt: ~{args.prompt_tokens} tokens, Output: {args.output_tokens} tokens\n")
+    
+    # Clear slots before starting
+    if not args.no_clear:
+        print("Clearing slots and cache files...")
+        await clear_all_slots()
+        print()
     
     # Generate prompt
     prompt = generate_prompt(args.prompt_tokens)
