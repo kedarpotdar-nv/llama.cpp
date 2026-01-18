@@ -119,7 +119,7 @@ if [ "$MODE" = "dual" ]; then
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
         -cb \
-        -fa \
+        -fa on \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
@@ -134,7 +134,7 @@ if [ "$MODE" = "dual" ]; then
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
         -cb \
-        -fa \
+        -fa on \
         --metrics \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!
@@ -156,7 +156,7 @@ else
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
         -cb \
-        -fa \
+        -fa on \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!
@@ -175,7 +175,7 @@ else
         --slot-save-path "$KV_CACHE_DIR/" \
         -np $N_SLOTS \
         -cb \
-        -fa \
+        -fa on \
         --metrics \
         2>&1 | sed 's/^/[DECODE]  /' &
     DECODE_PID=$!
