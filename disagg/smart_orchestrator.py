@@ -53,6 +53,8 @@ class Session:
     # Token tracking
     tokens: List[int] = field(default_factory=list)
     n_tokens: int = 0
+    tokens_cached: int = 0  # Actual tokens in cache (may include generated)
+    n_saved: int = 0        # Tokens saved to file
     
     # Slot assignments
     prefill_slot: int = -1
@@ -188,7 +190,7 @@ class SmartOrchestrator:
         
         logger.info(f"[{session.session_id}] Prefilling {len(tokens)} tokens on slot {slot_id}")
         
-        # Prefill (n_predict=0 means just process prompt)
+        # Prefill (n_predict=0 means just process prompt, but may generate 1 token)
         t_start = time.perf_counter()
         async with http.post(
             f"{self.config.prefill_url}/completion",
@@ -196,6 +198,7 @@ class SmartOrchestrator:
                 "prompt": tokens,  # Send as token IDs
                 "n_predict": 0,
                 "id_slot": slot_id,
+                "return_tokens": True,  # Get generated token IDs
             }
         ) as resp:
             if resp.status != 200:
@@ -206,7 +209,17 @@ class SmartOrchestrator:
         session.prefill_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.PREFILLED
         
-        logger.info(f"[{session.session_id}] Prefill complete: {session.prefill_time_ms:.1f}ms")
+        # Track actual tokens cached (includes any generated token)
+        session.tokens_cached = result.get("tokens_cached", len(tokens))
+        
+        # If any tokens were generated, append them to our token list
+        generated_token_ids = result.get("tokens", [])
+        if generated_token_ids:
+            session.tokens = tokens + generated_token_ids
+            logger.info(f"[{session.session_id}] Generated {len(generated_token_ids)} extra tokens during prefill")
+        
+        logger.info(f"[{session.session_id}] Prefill complete: {session.prefill_time_ms:.1f}ms, "
+                   f"tokens_cached={session.tokens_cached}, total_tokens={len(session.tokens)}")
         
         return result
     
@@ -238,6 +251,10 @@ class SmartOrchestrator:
             if resp.status != 200:
                 raise Exception(f"Save failed: {await resp.text()}")
             save_result = await resp.json()
+        
+        # Track how many tokens were saved
+        session.n_saved = save_result.get("n_saved", 0)
+        logger.info(f"[{session.session_id}] Saved {session.n_saved} tokens")
         
         # Restore to decode server
         async with http.post(
@@ -274,11 +291,11 @@ class SmartOrchestrator:
         """
         Generate tokens from the decode server.
         
-        KEY INSIGHT: After transfer, we send the SAME tokens to maintain
-        consistency, but the KV cache is already there. Yes, it re-processes
-        the prompt (due to broken cache_prompt), but the architecture is correct.
+        KEY INSIGHT: We send the EXACT same tokens that were saved (including
+        any generated during prefill). This ensures get_common_prefix matches
+        and the server can reuse the KV cache.
         
-        For a production system, we'd need to fix the server to skip re-processing.
+        The tokens to send = original prompt + any tokens generated during prefill
         """
         http = await self.get_http_session()
         
@@ -287,13 +304,17 @@ class SmartOrchestrator:
         
         session.state = SessionState.GENERATING
         
-        logger.info(f"[{session.session_id}] Generating {n_predict} tokens on slot {session.decode_slot}")
+        # Use tokens that match what was saved (original + generated during prefill)
+        tokens_to_send = session.tokens
+        
+        logger.info(f"[{session.session_id}] Generating {n_predict} tokens on slot {session.decode_slot}, "
+                   f"sending {len(tokens_to_send)} tokens (saved={session.n_saved})")
         
         t_start = time.perf_counter()
         async with http.post(
             f"{self.config.decode_url}/completion",
             json={
-                "prompt": session.tokens,  # Send same tokens
+                "prompt": tokens_to_send,  # Must match saved tokens exactly!
                 "n_predict": n_predict,
                 "temperature": temperature,
                 "id_slot": session.decode_slot,
@@ -312,6 +333,11 @@ class SmartOrchestrator:
         generated_tokens = result.get("tokens_predicted", 0)
         session.total_generated += generated_tokens
         
+        # Check if cache was actually used
+        timings = result.get("timings", {})
+        cache_n = timings.get("cache_n", 0)
+        prompt_n = timings.get("prompt_n", 0)
+        
         # Add metrics
         result["disagg_metrics"] = {
             "session_id": session.session_id,
@@ -321,9 +347,13 @@ class SmartOrchestrator:
             "total_time_ms": session.prefill_time_ms + session.transfer_time_ms + decode_time_ms,
             "n_prompt_tokens": session.n_tokens,
             "n_generated_tokens": generated_tokens,
+            "cache_n": cache_n,  # Tokens reused from cache
+            "prompt_n": prompt_n,  # Tokens processed
         }
         
-        logger.info(f"[{session.session_id}] Generated {generated_tokens} tokens in {decode_time_ms:.1f}ms")
+        cache_status = "✓ CACHE HIT" if cache_n > 0 else "✗ cache miss"
+        logger.info(f"[{session.session_id}] Generated {generated_tokens} tokens in {decode_time_ms:.1f}ms "
+                   f"({cache_status}: cache_n={cache_n}, prompt_n={prompt_n})")
         
         return result
     
