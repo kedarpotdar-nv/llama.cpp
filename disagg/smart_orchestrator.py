@@ -89,22 +89,40 @@ class SlotManager:
         self.n_slots = n_slots
         self.slots: Dict[int, Optional[str]] = {i: None for i in range(n_slots)}
         self._lock = asyncio.Lock()
+        self._slot_available = asyncio.Event()
+        self._slot_available.set()  # Initially slots are available
     
-    async def allocate(self, session_id: str) -> int:
-        """Allocate a slot for a session, returns slot_id or -1 if none available"""
-        async with self._lock:
-            # First check if session already has a slot
-            for slot_id, owner in self.slots.items():
-                if owner == session_id:
-                    return slot_id
+    async def allocate(self, session_id: str, timeout: float = 30.0) -> int:
+        """
+        Allocate a slot for a session.
+        Waits up to timeout seconds if no slot is immediately available.
+        Returns slot_id or -1 if timeout.
+        """
+        deadline = time.time() + timeout
+        
+        while time.time() < deadline:
+            async with self._lock:
+                # First check if session already has a slot
+                for slot_id, owner in self.slots.items():
+                    if owner == session_id:
+                        return slot_id
+                
+                # Find free slot
+                for slot_id, owner in self.slots.items():
+                    if owner is None:
+                        self.slots[slot_id] = session_id
+                        # Check if all slots are now taken
+                        if all(v is not None for v in self.slots.values()):
+                            self._slot_available.clear()
+                        return slot_id
             
-            # Find free slot
-            for slot_id, owner in self.slots.items():
-                if owner is None:
-                    self.slots[slot_id] = session_id
-                    return slot_id
-            
-            return -1  # No slots available
+            # No slot available, wait a bit
+            try:
+                await asyncio.wait_for(self._slot_available.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass  # Continue loop and try again
+        
+        return -1  # Timeout
     
     async def release(self, session_id: str):
         """Release all slots owned by a session"""
@@ -112,6 +130,8 @@ class SlotManager:
             for slot_id, owner in self.slots.items():
                 if owner == session_id:
                     self.slots[slot_id] = None
+            # Signal that a slot is now available
+            self._slot_available.set()
     
     async def get_slot(self, session_id: str) -> int:
         """Get the slot assigned to a session, or -1 if none"""
@@ -173,31 +193,28 @@ class SmartOrchestrator:
         """
         Prefill a prompt on the prefill server.
         Returns prefill result with timing info.
+        
+        Note: We don't manage prefill slots - the server handles its own
+        slot allocation and continuous batching. We use id_slot=-1 to let
+        the server pick an available slot.
         """
         http = await self.get_http_session()
-        
-        # Allocate prefill slot
-        slot_id = await self.prefill_slots.allocate(session.session_id)
-        if slot_id < 0:
-            raise Exception("No prefill slots available")
-        
-        session.prefill_slot = slot_id
         
         # Tokenize first to track tokens
         tokens = await self.tokenize(prompt)
         session.tokens = tokens
         session.n_tokens = len(tokens)
         
-        logger.info(f"[{session.session_id}] Prefilling {len(tokens)} tokens on slot {slot_id}")
+        logger.info(f"[{session.session_id}] Prefilling {len(tokens)} tokens")
         
         # Prefill (n_predict=0 means just process prompt, but may generate 1 token)
+        # Let server pick slot (id_slot=-1 or omit it)
         t_start = time.perf_counter()
         async with http.post(
             f"{self.config.prefill_url}/completion",
             json={
                 "prompt": tokens,  # Send as token IDs
                 "n_predict": 0,
-                "id_slot": slot_id,
                 "return_tokens": True,  # Get generated token IDs
             }
         ) as resp:
@@ -209,6 +226,9 @@ class SmartOrchestrator:
         session.prefill_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.PREFILLED
         
+        # Capture which slot was used (needed for save)
+        session.prefill_slot = result.get("id_slot", 0)
+        
         # Track actual tokens cached (includes any generated token)
         session.tokens_cached = result.get("tokens_cached", len(tokens))
         
@@ -219,7 +239,7 @@ class SmartOrchestrator:
             logger.info(f"[{session.session_id}] Generated {len(generated_token_ids)} extra tokens during prefill")
         
         logger.info(f"[{session.session_id}] Prefill complete: {session.prefill_time_ms:.1f}ms, "
-                   f"tokens_cached={session.tokens_cached}, total_tokens={len(session.tokens)}")
+                   f"slot={session.prefill_slot}, tokens_cached={session.tokens_cached}")
         
         return result
     
@@ -268,9 +288,6 @@ class SmartOrchestrator:
         t_end = time.perf_counter()
         session.transfer_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.TRANSFERRED
-        
-        # Release prefill slot (we're done with it)
-        await self.prefill_slots.release(session.session_id)
         
         logger.info(f"[{session.session_id}] KV transfer complete: {session.transfer_time_ms:.1f}ms, "
                    f"decode_slot={decode_slot}")
@@ -362,6 +379,7 @@ class SmartOrchestrator:
         prompt: str,
         n_predict: int = 100,
         session_id: Optional[str] = None,
+        keep_session: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -369,19 +387,31 @@ class SmartOrchestrator:
         1. Prefill on prefill server
         2. Transfer KV cache to decode server  
         3. Generate on decode server
+        
+        Args:
+            keep_session: If False (default), release the decode slot after completion
+                         to allow other requests to use it. Set True for multi-turn.
         """
         session = self.get_or_create_session(session_id)
         
-        # Step 1: Prefill
-        await self.prefill(session, prompt)
+        try:
+            # Step 1: Prefill
+            await self.prefill(session, prompt)
+            
+            # Step 2: Transfer
+            await self.transfer_kv_cache(session)
+            
+            # Step 3: Generate
+            result = await self.generate(session, n_predict=n_predict, **kwargs)
+            
+            return result
         
-        # Step 2: Transfer
-        await self.transfer_kv_cache(session)
-        
-        # Step 3: Generate
-        result = await self.generate(session, n_predict=n_predict, **kwargs)
-        
-        return result
+        finally:
+            # Release decode slot for reuse (unless keeping session for multi-turn)
+            if not keep_session:
+                await self.decode_slots.release(session.session_id)
+                if session.session_id in self.sessions:
+                    del self.sessions[session.session_id]
     
     async def baseline_completion(
         self,
@@ -518,9 +548,8 @@ async def handle_clear_sessions(request: web.Request) -> web.Response:
     """Clear all sessions and release slots"""
     orchestrator: SmartOrchestrator = request.app["orchestrator"]
     
-    # Release all slots
+    # Release all decode slots
     for sid in list(orchestrator.sessions.keys()):
-        await orchestrator.prefill_slots.release(sid)
         await orchestrator.decode_slots.release(sid)
     
     count = len(orchestrator.sessions)
