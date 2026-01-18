@@ -68,6 +68,11 @@ class Session:
     prefill_time_ms: float = 0
     transfer_time_ms: float = 0
     total_generated: int = 0
+    
+    # Prefill server timings (captured from prefill response)
+    prefill_prompt_ms: float = 0      # Time to process prompt on prefill server
+    prefill_prompt_tps: float = 0     # Prompt tokens/sec on prefill server
+    prefill_tokens_evaluated: int = 0  # Tokens actually evaluated (not cached)
 
 
 @dataclass 
@@ -229,6 +234,12 @@ class SmartOrchestrator:
         session.prefill_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.PREFILLED
         
+        # Capture prefill server's timing metrics
+        prefill_timings = result.get("timings", {})
+        session.prefill_prompt_ms = prefill_timings.get("prompt_ms", 0)
+        session.prefill_prompt_tps = prefill_timings.get("prompt_per_second", 0)
+        session.prefill_tokens_evaluated = prefill_timings.get("prompt_n", 0)
+        
         # Track actual tokens cached (includes any generated token)
         session.tokens_cached = result.get("tokens_cached", len(tokens))
         
@@ -239,7 +250,8 @@ class SmartOrchestrator:
             logger.info(f"[{session.session_id}] Generated {len(generated_token_ids)} extra tokens during prefill")
         
         logger.info(f"[{session.session_id}] Prefill complete: {session.prefill_time_ms:.1f}ms, "
-                   f"slot={session.prefill_slot}, tokens_cached={session.tokens_cached}")
+                   f"slot={session.prefill_slot}, tokens_cached={session.tokens_cached}, "
+                   f"prefill_tps={session.prefill_prompt_tps:.1f}")
         
         return result
     
@@ -359,6 +371,8 @@ class SmartOrchestrator:
         prompt_n = timings.get("prompt_n", 0)
         
         # Add metrics
+        # Note: For disagg, prompt TPS comes from PREFILL server (where real work happens)
+        # The decode server's prompt_n should be ~0-1 if cache hit worked
         result["disagg_metrics"] = {
             "session_id": session.session_id,
             "prefill_time_ms": session.prefill_time_ms,
@@ -366,10 +380,17 @@ class SmartOrchestrator:
             "decode_time_ms": decode_time_ms,
             "total_time_ms": session.prefill_time_ms + session.transfer_time_ms + decode_time_ms,
             "n_prompt_tokens": session.n_tokens,
-            "tokens_evaluated": session.n_tokens,  # Same as n_prompt_tokens for consistency
+            "tokens_evaluated": session.n_tokens,
             "n_generated_tokens": generated_tokens,
-            "cache_n": cache_n,  # Tokens reused from cache
-            "prompt_n": prompt_n,  # Tokens processed (should be 0 if cache hit)
+            "cache_n": cache_n,  # Tokens reused from cache on decode server
+            "prompt_n": prompt_n,  # Tokens processed on decode server (should be ~0 if cache hit)
+            # Prefill server metrics (where real prompt processing happens)
+            "prefill_prompt_ms": session.prefill_prompt_ms,
+            "prefill_prompt_tps": session.prefill_prompt_tps,
+            "prefill_tokens_evaluated": session.prefill_tokens_evaluated,
+            # Decode server metrics (for comparison)
+            "decode_prompt_tps": timings.get("prompt_per_second", 0),
+            "decode_tps": timings.get("predicted_per_second", 0),
         }
         
         cache_status = "✓ CACHE HIT" if cache_n > 0 else "✗ cache miss"

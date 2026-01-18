@@ -215,6 +215,8 @@ async def make_disagg_request(
             metrics = result.get("disagg_metrics", {})
             timings = result.get("timings", {})
             
+            # For disagg: use PREFILL server's prompt TPS (where real work happens)
+            # The decode server's prompt TPS is meaningless with cache hit (~1 token)
             return RequestResult(
                 request_id=request_id,
                 success=True,
@@ -224,10 +226,10 @@ async def make_disagg_request(
                 decode_time_ms=metrics.get("decode_time_ms", 0),
                 cache_n=metrics.get("cache_n", 0),
                 prompt_n=metrics.get("prompt_n", 0),
-                tokens_evaluated=metrics.get("tokens_evaluated", 0),
+                tokens_evaluated=metrics.get("prefill_tokens_evaluated", metrics.get("tokens_evaluated", 0)),
                 tokens_generated=metrics.get("n_generated_tokens", timings.get("predicted_n", 0)),
-                prompt_tps=timings.get("prompt_per_second", 0),
-                decode_tps=timings.get("predicted_per_second", 0),
+                prompt_tps=metrics.get("prefill_prompt_tps", 0),  # From prefill server!
+                decode_tps=metrics.get("decode_tps", timings.get("predicted_per_second", 0)),
             )
     
     except Exception as e:
@@ -376,6 +378,7 @@ def print_results(baseline: BenchmarkResult, disagg: BenchmarkResult):
     # TPS metrics
     print("TOKENS/SEC (server-reported):")
     print(f"{'  Prompt processing TPS':<35} {fmt(baseline.avg_prompt_tps, ' t/s'):>18} {fmt(disagg.avg_prompt_tps, ' t/s'):>18}")
+    print(f"{'    (baseline: single server, disagg: prefill server)':<70}")
     print(f"{'  Decode TPS':<35} {fmt(baseline.avg_decode_tps, ' t/s'):>18} {fmt(disagg.avg_decode_tps, ' t/s'):>18}")
     print()
     
