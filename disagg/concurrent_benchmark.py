@@ -469,6 +469,8 @@ async def main():
                         help="Only run disaggregated test")
     parser.add_argument("--no-clear", action="store_true",
                         help="Skip clearing slots before benchmark")
+    parser.add_argument("--output", "-O", type=str, default=None,
+                        help="Save results to JSON file")
     
     args = parser.parse_args()
     
@@ -568,6 +570,37 @@ async def main():
         print(f"  Avg latency: {disagg_result.avg_latency_ms:.0f}ms")
         print(f"  Cache hit rate: {disagg_result.cache_hit_rate*100:.0f}%")
         print(f"  Throughput: {disagg_result.requests_per_sec:.1f} req/s")
+    
+    # Save JSON results
+    if args.output:
+        from dataclasses import asdict
+        from datetime import datetime
+        
+        results = {
+            "timestamp": datetime.now().isoformat(),
+            "config": {
+                "concurrency": args.concurrency,
+                "requests": args.requests,
+                "prompt_tokens": args.prompt_tokens,
+                "output_tokens": args.output_tokens,
+            },
+            "baseline": asdict(baseline_result) if baseline_result else None,
+            "disagg": asdict(disagg_result) if disagg_result else None,
+        }
+        
+        # Add summary if both present
+        if baseline_result and disagg_result:
+            speedup = baseline_result.avg_latency_ms / disagg_result.avg_latency_ms if disagg_result.avg_latency_ms > 0 else 0
+            throughput_gain = disagg_result.requests_per_sec / baseline_result.requests_per_sec if baseline_result.requests_per_sec > 0 else 0
+            results["summary"] = {
+                "latency_speedup": speedup,
+                "throughput_gain": throughput_gain,
+                "disagg_wins": speedup > 1,
+            }
+        
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n✓ Results saved to {args.output}")
 
 
 if __name__ == "__main__":
