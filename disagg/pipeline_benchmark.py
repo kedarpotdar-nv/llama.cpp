@@ -42,7 +42,12 @@ class RequestMetrics:
     decode_time_ms: float = 0
     total_time_ms: float = 0
     cache_hit: bool = False
+    cache_n: int = 0           # Tokens reused from cache
+    prompt_n: int = 0          # Tokens processed in decode
     tokens_generated: int = 0
+    tokens_evaluated: int = 0  # Tokens evaluated in prefill
+    prefill_tps: float = 0     # Prefill server TPS
+    decode_tps: float = 0      # Decode server TPS
     error: str = ""
 
 
@@ -77,6 +82,10 @@ class PipelineResult:
     requests_per_sec: float = 0
     tokens_per_sec: float = 0
     
+    # TPS metrics (server-reported)
+    avg_prefill_tps: float = 0   # Avg prompt processing TPS
+    avg_decode_tps: float = 0    # Avg decode TPS
+    
     # Phase utilization (for disagg)
     prefill_utilization: float = 0  # % time prefill workers were busy
     decode_utilization: float = 0   # % time decode workers were busy
@@ -87,6 +96,8 @@ class PipelineResult:
     avg_transfer_ms: float = 0
     avg_decode_ms: float = 0
     
+    # Cache stats
+    avg_cache_n: float = 0
     cache_hit_rate: float = 0
     
     waves: List[WaveMetrics] = field(default_factory=list)
@@ -187,12 +198,18 @@ class DisaggPipelineRunner:
             if not final_tokens:
                 final_tokens = tokens
             
+            # Extract timing metrics from prefill server
+            timings = result.get("timings", {})
+            
             return {
                 "request_id": req["request_id"],
                 "tokens": final_tokens,
                 "slot": slot,
                 "n_tokens": len(final_tokens),
                 "time_ms": (t_end - t_start) * 1000,
+                "prefill_prompt_ms": timings.get("prompt_ms", 0),
+                "prefill_tps": timings.get("prompt_per_second", 0),
+                "tokens_evaluated": timings.get("prompt_n", 0),
             }
         
         # Process in chunks of n_prefill_slots to avoid slot conflicts
@@ -322,6 +339,7 @@ class DisaggPipelineRunner:
                 "tokens_generated": timings.get("predicted_n", 0),
                 "cache_n": timings.get("cache_n", 0),
                 "prompt_n": timings.get("prompt_n", 0),
+                "decode_tps": timings.get("predicted_per_second", 0),
                 "content": result.get("content", ""),
             }
         
@@ -432,7 +450,12 @@ class DisaggPipelineRunner:
                                 transfer_time_ms=dr.get("save_time_ms", 0) + dr.get("restore_time_ms", 0),
                                 decode_time_ms=dr.get("decode_time_ms", 0),
                                 cache_hit=dr.get("cache_n", 0) > 0,
+                                cache_n=dr.get("cache_n", 0),
+                                prompt_n=dr.get("prompt_n", 0),
                                 tokens_generated=dr.get("tokens_generated", 0),
+                                tokens_evaluated=dr.get("tokens_evaluated", 0),
+                                prefill_tps=dr.get("prefill_tps", 0),
+                                decode_tps=dr.get("decode_tps", 0),
                                 error=dr.get("error", ""),
                             ))
                 
@@ -471,6 +494,15 @@ class DisaggPipelineRunner:
             result.tokens_per_sec = total_tokens / result.total_time_sec
             result.requests_per_sec = len(successful) / result.total_time_sec
             
+            # TPS metrics (server-reported)
+            prefill_tps_values = [r.prefill_tps for r in successful if r.prefill_tps > 0]
+            decode_tps_values = [r.decode_tps for r in successful if r.decode_tps > 0]
+            result.avg_prefill_tps = statistics.mean(prefill_tps_values) if prefill_tps_values else 0
+            result.avg_decode_tps = statistics.mean(decode_tps_values) if decode_tps_values else 0
+            
+            # Cache stats
+            cache_ns = [r.cache_n for r in successful]
+            result.avg_cache_n = statistics.mean(cache_ns) if cache_ns else 0
             cache_hits = sum(1 for r in successful if r.cache_hit)
             result.cache_hit_rate = cache_hits / len(successful) if successful else 0
         
@@ -548,6 +580,9 @@ class BaselineRunner:
                         decode_time_ms=timings.get("predicted_ms", 0),
                         total_time_ms=(t_end - t_start) * 1000,
                         tokens_generated=timings.get("predicted_n", 0),
+                        tokens_evaluated=timings.get("prompt_n", 0),
+                        prefill_tps=timings.get("prompt_per_second", 0),
+                        decode_tps=timings.get("predicted_per_second", 0),
                     )
                 except Exception as e:
                     return RequestMetrics(
@@ -575,6 +610,12 @@ class BaselineRunner:
             total_tokens = sum(m.tokens_generated for m in successful)
             result.tokens_per_sec = total_tokens / result.total_time_sec
             result.requests_per_sec = len(successful) / result.total_time_sec
+            
+            # TPS metrics (server-reported)
+            prefill_tps_values = [m.prefill_tps for m in successful if m.prefill_tps > 0]
+            decode_tps_values = [m.decode_tps for m in successful if m.decode_tps > 0]
+            result.avg_prefill_tps = statistics.mean(prefill_tps_values) if prefill_tps_values else 0
+            result.avg_decode_tps = statistics.mean(decode_tps_values) if decode_tps_values else 0
         
         return result
 
@@ -606,21 +647,28 @@ def print_results(baseline: PipelineResult, disagg: PipelineResult):
     print(f"{'Successful Requests':<35} {baseline.successful_requests:>18} {disagg.successful_requests:>18}")
     print()
     
-    print("THROUGHPUT:")
-    print(f"{'  Requests/sec':<35} {fmt(baseline.requests_per_sec):>18} {fmt(disagg.requests_per_sec):>18}")
-    print(f"{'  Tokens/sec':<35} {fmt(baseline.tokens_per_sec):>18} {fmt(disagg.tokens_per_sec):>18}")
-    print()
-    
     print("LATENCY (per request avg):")
     print(f"{'  Total Latency':<35} {fmt(baseline.avg_latency_ms, 'ms'):>18} {fmt(disagg.avg_latency_ms, 'ms'):>18}")
     print(f"{'  Prefill Time':<35} {fmt(baseline.avg_prefill_ms, 'ms'):>18} {fmt(disagg.avg_prefill_ms, 'ms'):>18}")
     if disagg.avg_transfer_ms > 0:
-        print(f"{'  Transfer Time':<35} {'-':>18} {fmt(disagg.avg_transfer_ms, 'ms'):>18}")
+        print(f"{'  Transfer Time (save+restore)':<35} {'-':>18} {fmt(disagg.avg_transfer_ms, 'ms'):>18}")
     print(f"{'  Decode Time':<35} {fmt(baseline.avg_decode_ms, 'ms'):>18} {fmt(disagg.avg_decode_ms, 'ms'):>18}")
     print()
     
-    if disagg.cache_hit_rate > 0:
-        print(f"{'Cache Hit Rate (disagg)':<35} {'-':>18} {fmt(disagg.cache_hit_rate * 100, '%'):>18}")
+    print("TOKENS/SEC (server-reported):")
+    print(f"{'  Prompt processing TPS':<35} {fmt(baseline.avg_prefill_tps, ' t/s'):>18} {fmt(disagg.avg_prefill_tps, ' t/s'):>18}")
+    print(f"{'    (baseline: single server, disagg: prefill server)':<70}")
+    print(f"{'  Decode TPS':<35} {fmt(baseline.avg_decode_tps, ' t/s'):>18} {fmt(disagg.avg_decode_tps, ' t/s'):>18}")
+    print()
+    
+    print("THROUGHPUT:")
+    print(f"{'  Requests/sec':<35} {fmt(baseline.requests_per_sec):>18} {fmt(disagg.requests_per_sec):>18}")
+    print(f"{'  Output tokens/sec':<35} {fmt(baseline.tokens_per_sec):>18} {fmt(disagg.tokens_per_sec):>18}")
+    print()
+    
+    print("CACHE (disagg only):")
+    print(f"{'  Avg Cache Reuse':<35} {'-':>18} {fmt(disagg.avg_cache_n, ' tokens'):>18}")
+    print(f"{'  Cache Hit Rate':<35} {'-':>18} {fmt(disagg.cache_hit_rate * 100, '%'):>18}")
     
     print("\n" + "-"*80)
     
