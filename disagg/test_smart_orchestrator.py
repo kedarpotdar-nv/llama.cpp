@@ -158,6 +158,15 @@ def benchmark_comparison():
     print("BENCHMARK: Baseline vs Disaggregated")
     print("="*60)
     
+    # Clear any existing sessions first
+    print("Clearing previous sessions...")
+    try:
+        resp = requests.post(f"{ORCHESTRATOR_URL}/clear")
+        if resp.status_code == 200:
+            print(f"  Cleared {resp.json().get('cleared', 0)} sessions")
+    except:
+        pass
+    
     # Generate a longer prompt
     prompt = """You are an expert software engineer. Please explain the following concepts in detail:
     
@@ -188,12 +197,17 @@ Please provide comprehensive explanations with examples."""
         if resp.status_code == 200:
             baseline_times.append((t_end - t_start) * 1000)
             print(f"  Run {i+1}: {baseline_times[-1]:.1f}ms")
+        else:
+            print(f"  Run {i+1}: FAILED - {resp.status_code}")
     
     # Disaggregated runs
     print("\nRunning disaggregated...")
     disagg_times = []
     disagg_details = []
     for i in range(n_runs):
+        # Clear sessions between runs to free slots
+        requests.post(f"{ORCHESTRATOR_URL}/clear")
+        
         t_start = time.perf_counter()
         resp = requests.post(
             f"{ORCHESTRATOR_URL}/completion",
@@ -210,6 +224,8 @@ Please provide comprehensive explanations with examples."""
                   f"(prefill={metrics.get('prefill_time_ms', 0):.0f}, "
                   f"transfer={metrics.get('transfer_time_ms', 0):.0f}, "
                   f"decode={metrics.get('decode_time_ms', 0):.0f})")
+        else:
+            print(f"  Run {i+1}: FAILED - {resp.status_code}: {resp.text[:100]}")
     
     # Summary
     print("\n" + "-"*40)
@@ -243,6 +259,13 @@ Please provide comprehensive explanations with examples."""
                 print("   This architecture would benefit from server-side optimization.")
 
 
+def clear_sessions():
+    """Helper to clear all sessions"""
+    try:
+        requests.post(f"{ORCHESTRATOR_URL}/clear")
+    except:
+        pass
+
 def main():
     print("""
 ╔═══════════════════════════════════════════════════════════╗
@@ -252,10 +275,14 @@ def main():
     
     try:
         test_health()
+        clear_sessions()
         test_baseline()
+        clear_sessions()
         test_disagg()
         test_sessions()
+        clear_sessions()
         test_continue()
+        clear_sessions()
         benchmark_comparison()
         
         print("\n" + "="*60)

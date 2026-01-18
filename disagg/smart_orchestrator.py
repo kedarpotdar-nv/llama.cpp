@@ -75,8 +75,9 @@ class ServerConfig:
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
     # Slot counts (should match server -np settings)
-    prefill_slots: int = 1
-    decode_slots: int = 2
+    # These are tracked by orchestrator; actual server slots set via -np
+    prefill_slots: int = 4
+    decode_slots: int = 4
 
 
 class SlotManager:
@@ -483,6 +484,22 @@ async def handle_sessions(request: web.Request) -> web.Response:
     return web.json_response({"sessions": sessions})
 
 
+async def handle_clear_sessions(request: web.Request) -> web.Response:
+    """Clear all sessions and release slots"""
+    orchestrator: SmartOrchestrator = request.app["orchestrator"]
+    
+    # Release all slots
+    for sid in list(orchestrator.sessions.keys()):
+        await orchestrator.prefill_slots.release(sid)
+        await orchestrator.decode_slots.release(sid)
+    
+    count = len(orchestrator.sessions)
+    orchestrator.sessions.clear()
+    
+    logger.info(f"Cleared {count} sessions")
+    return web.json_response({"cleared": count})
+
+
 async def handle_health(request: web.Request) -> web.Response:
     """Health check"""
     return web.json_response({"status": "ok"})
@@ -517,6 +534,7 @@ def create_app(prefill_url: str, decode_url: str) -> web.Application:
     app.router.add_post("/completion", handle_completion)
     app.router.add_post("/continue", handle_continue)
     app.router.add_get("/sessions", handle_sessions)
+    app.router.add_post("/clear", handle_clear_sessions)
     
     return app
 
