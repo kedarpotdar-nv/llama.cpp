@@ -76,9 +76,9 @@ class ServerConfig:
     decode_url: str = "http://localhost:8081"
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
-    # Decode slots tracked by orchestrator - should match decode server's -np
-    # (prefill slots no longer tracked - server handles its own batching)
-    decode_slots: int = 8
+    # Slot counts - should match server -np settings
+    prefill_slots: int = 2  # Prefill server slots
+    decode_slots: int = 8   # Decode server slots
 
 
 class SlotManager:
@@ -153,6 +153,7 @@ class SmartOrchestrator:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.sessions: Dict[str, Session] = {}
+        self.prefill_slots = SlotManager(config.prefill_slots)
         self.decode_slots = SlotManager(config.decode_slots)
         self._session: Optional[aiohttp.ClientSession] = None
         
@@ -192,27 +193,31 @@ class SmartOrchestrator:
         Prefill a prompt on the prefill server.
         Returns prefill result with timing info.
         
-        Note: We don't manage prefill slots - the server handles its own
-        slot allocation and continuous batching. We use id_slot=-1 to let
-        the server pick an available slot.
+        We allocate a specific prefill slot to avoid race conditions during save.
         """
         http = await self.get_http_session()
+        
+        # Allocate prefill slot (waits if none available)
+        slot_id = await self.prefill_slots.allocate(session.session_id, timeout=60.0)
+        if slot_id < 0:
+            raise Exception("No prefill slots available (timeout)")
+        session.prefill_slot = slot_id
         
         # Tokenize first to track tokens
         tokens = await self.tokenize(prompt)
         session.tokens = tokens
         session.n_tokens = len(tokens)
         
-        logger.info(f"[{session.session_id}] Prefilling {len(tokens)} tokens")
+        logger.info(f"[{session.session_id}] Prefilling {len(tokens)} tokens on slot {slot_id}")
         
         # Prefill (n_predict=0 means just process prompt, but may generate 1 token)
-        # Let server pick slot (id_slot=-1 or omit it)
         t_start = time.perf_counter()
         async with http.post(
             f"{self.config.prefill_url}/completion",
             json={
                 "prompt": tokens,  # Send as token IDs
                 "n_predict": 0,
+                "id_slot": slot_id,  # Use our allocated slot
                 "return_tokens": True,  # Get generated token IDs
             }
         ) as resp:
@@ -223,9 +228,6 @@ class SmartOrchestrator:
         t_end = time.perf_counter()
         session.prefill_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.PREFILLED
-        
-        # Capture which slot was used (needed for save)
-        session.prefill_slot = result.get("id_slot", 0)
         
         # Track actual tokens cached (includes any generated token)
         session.tokens_cached = result.get("tokens_cached", len(tokens))
@@ -286,6 +288,9 @@ class SmartOrchestrator:
         t_end = time.perf_counter()
         session.transfer_time_ms = (t_end - t_start) * 1000
         session.state = SessionState.TRANSFERRED
+        
+        # Release prefill slot now that we've saved
+        await self.prefill_slots.release(session.session_id)
         
         logger.info(f"[{session.session_id}] KV transfer complete: {session.transfer_time_ms:.1f}ms, "
                    f"decode_slot={decode_slot}")
@@ -396,13 +401,18 @@ class SmartOrchestrator:
             # Step 1: Prefill
             await self.prefill(session, prompt)
             
-            # Step 2: Transfer
+            # Step 2: Transfer (this releases prefill slot after save)
             await self.transfer_kv_cache(session)
             
             # Step 3: Generate
             result = await self.generate(session, n_predict=n_predict, **kwargs)
             
             return result
+        
+        except Exception:
+            # On error, make sure to release prefill slot if still held
+            await self.prefill_slots.release(session.session_id)
+            raise
         
         finally:
             # Release decode slot for reuse (unless keeping session for multi-turn)
@@ -546,8 +556,9 @@ async def handle_clear_sessions(request: web.Request) -> web.Response:
     """Clear all sessions and release slots"""
     orchestrator: SmartOrchestrator = request.app["orchestrator"]
     
-    # Release all decode slots
+    # Release all slots
     for sid in list(orchestrator.sessions.keys()):
+        await orchestrator.prefill_slots.release(sid)
         await orchestrator.decode_slots.release(sid)
     
     count = len(orchestrator.sessions)
