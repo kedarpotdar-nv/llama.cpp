@@ -100,10 +100,10 @@ echo ""
 
 if [ "$MODE" = "dual" ]; then
     # DUAL GPU MODE: Each server on separate GPU
-    # Prefill: 2 slots (handles long prompts, continuous batching)
+    # Prefill: 4 slots (handles long prompts, better batch throughput)
     # Decode: 8 slots (many concurrent short generations)
     
-    echo "Starting Prefill Server on port 8080 (GPU 0, 2 slots)..."
+    echo "Starting Prefill Server on port 8080 (GPU 0, 4 slots)..."
     CUDA_VISIBLE_DEVICES=0 $SERVER_BIN \
         -m "$MODEL_PATH" \
         --port 8080 \
@@ -111,7 +111,7 @@ if [ "$MODE" = "dual" ]; then
         -c "$CTX_SIZE" \
         -ngl 99 \
         --slot-save-path "$KV_CACHE_DIR/" \
-        -np 2 \
+        -np 4 \
         --metrics \
         2>&1 | sed 's/^/[PREFILL] /' &
     PREFILL_PID=$!

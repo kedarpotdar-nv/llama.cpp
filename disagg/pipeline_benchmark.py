@@ -152,28 +152,33 @@ class DisaggPipelineRunner:
         """
         Prefill a batch of requests on the prefill server.
         Returns list of {tokens, slot, n_tokens, time_ms} for each request.
+        
+        Important: Process in chunks matching prefill server slots to avoid conflicts.
         """
         http = await self.get_http()
-        results = []
+        n_prefill_slots = 4  # Prefill server slots (match -np in start_servers.sh)
+        all_results = []
         
-        # Run prefills concurrently (limited by server slots)
-        async def prefill_one(idx: int, req: Dict) -> Dict[str, Any]:
-            slot = (slot_offset + idx) % 2  # Prefill server has 2 slots
+        async def prefill_one(req: Dict, slot: int) -> Dict[str, Any]:
             tokens = req["tokens"]
             
             t_start = time.perf_counter()
-            async with http.post(
-                f"{self.prefill_url}/completion",
-                json={
-                    "prompt": tokens,
-                    "n_predict": 0,
-                    "id_slot": slot,
-                    "return_tokens": True,
-                }
-            ) as resp:
-                if resp.status != 200:
-                    return {"error": await resp.text(), "slot": slot}
-                result = await resp.json()
+            try:
+                async with http.post(
+                    f"{self.prefill_url}/completion",
+                    json={
+                        "prompt": tokens,
+                        "n_predict": 0,
+                        "id_slot": slot,
+                        "return_tokens": True,
+                    }
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        return {"error": f"HTTP {resp.status}: {error_text[:100]}", "slot": slot, "request_id": req["request_id"]}
+                    result = await resp.json()
+            except Exception as e:
+                return {"error": str(e), "slot": slot, "request_id": req["request_id"]}
             
             t_end = time.perf_counter()
             
@@ -190,14 +195,18 @@ class DisaggPipelineRunner:
                 "time_ms": (t_end - t_start) * 1000,
             }
         
-        tasks = [prefill_one(i, req) for i, req in enumerate(requests)]
-        results = await asyncio.gather(*tasks)
-        return results
+        # Process in chunks of n_prefill_slots to avoid slot conflicts
+        for chunk_start in range(0, len(requests), n_prefill_slots):
+            chunk = requests[chunk_start:chunk_start + n_prefill_slots]
+            tasks = [prefill_one(req, i % n_prefill_slots) for i, req in enumerate(chunk)]
+            chunk_results = await asyncio.gather(*tasks)
+            all_results.extend(chunk_results)
+        
+        return all_results
     
     async def save_batch(self, prefill_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Save KV caches from prefill server"""
+        """Save KV caches from prefill server - must be done sequentially per slot"""
         http = await self.get_http()
-        results = []
         
         async def save_one(pr: Dict) -> Dict[str, Any]:
             if "error" in pr:
@@ -206,13 +215,17 @@ class DisaggPipelineRunner:
             filename = f"kv_{pr['request_id']}.bin"
             t_start = time.perf_counter()
             
-            async with http.post(
-                f"{self.prefill_url}/slots/{pr['slot']}?action=save",
-                json={"filename": filename}
-            ) as resp:
-                if resp.status != 200:
-                    return {**pr, "error": f"Save failed: {await resp.text()}"}
-                result = await resp.json()
+            try:
+                async with http.post(
+                    f"{self.prefill_url}/slots/{pr['slot']}?action=save",
+                    json={"filename": filename}
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        return {**pr, "error": f"Save failed: {error_text[:100]}"}
+                    result = await resp.json()
+            except Exception as e:
+                return {**pr, "error": f"Save exception: {str(e)}"}
             
             t_end = time.perf_counter()
             return {
@@ -222,8 +235,10 @@ class DisaggPipelineRunner:
                 "save_time_ms": (t_end - t_start) * 1000,
             }
         
-        tasks = [save_one(pr) for pr in prefill_results]
-        results = await asyncio.gather(*tasks)
+        # Save sequentially to avoid conflicts (saves must complete before slot reuse)
+        results = []
+        for pr in prefill_results:
+            results.append(await save_one(pr))
         return results
     
     async def restore_batch(
@@ -233,22 +248,27 @@ class DisaggPipelineRunner:
     ) -> List[Dict[str, Any]]:
         """Restore KV caches to decode server"""
         http = await self.get_http()
-        results = []
+        n_decode_slots = 8  # Decode server has 8 slots
         
         async def restore_one(idx: int, sr: Dict) -> Dict[str, Any]:
             if "error" in sr:
                 return sr
             
-            decode_slot = (slot_offset + idx) % 8  # Decode server has 8 slots
+            # Use unique slot per request within batch
+            decode_slot = (slot_offset + idx) % n_decode_slots
             t_start = time.perf_counter()
             
-            async with http.post(
-                f"{self.decode_url}/slots/{decode_slot}?action=restore",
-                json={"filename": sr["filename"]}
-            ) as resp:
-                if resp.status != 200:
-                    return {**sr, "error": f"Restore failed: {await resp.text()}"}
-                await resp.json()
+            try:
+                async with http.post(
+                    f"{self.decode_url}/slots/{decode_slot}?action=restore",
+                    json={"filename": sr["filename"]}
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        return {**sr, "error": f"Restore failed: {error_text[:100]}"}
+                    await resp.json()
+            except Exception as e:
+                return {**sr, "error": f"Restore exception: {str(e)}"}
             
             t_end = time.perf_counter()
             return {
@@ -257,6 +277,7 @@ class DisaggPipelineRunner:
                 "restore_time_ms": (t_end - t_start) * 1000,
             }
         
+        # Can restore all in parallel since we have 8 decode slots
         tasks = [restore_one(i, sr) for i, sr in enumerate(saved_results)]
         results = await asyncio.gather(*tasks)
         return results
@@ -274,19 +295,23 @@ class DisaggPipelineRunner:
                 return rr
             
             t_start = time.perf_counter()
-            async with http.post(
-                f"{self.decode_url}/completion",
-                json={
-                    "prompt": rr["tokens"],
-                    "n_predict": n_predict,
-                    "id_slot": rr["decode_slot"],
-                    "cache_prompt": True,
-                    "temperature": 0.7,
-                }
-            ) as resp:
-                if resp.status != 200:
-                    return {**rr, "error": f"Decode failed: {await resp.text()}"}
-                result = await resp.json()
+            try:
+                async with http.post(
+                    f"{self.decode_url}/completion",
+                    json={
+                        "prompt": rr["tokens"],
+                        "n_predict": n_predict,
+                        "id_slot": rr["decode_slot"],
+                        "cache_prompt": True,
+                        "temperature": 0.7,
+                    }
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        return {**rr, "error": f"Decode failed: {error_text[:100]}"}
+                    result = await resp.json()
+            except Exception as e:
+                return {**rr, "error": f"Decode exception: {str(e)}"}
             
             t_end = time.perf_counter()
             timings = result.get("timings", {})
@@ -300,6 +325,7 @@ class DisaggPipelineRunner:
                 "content": result.get("content", ""),
             }
         
+        # Can decode all in parallel on 8 decode slots
         tasks = [decode_one(rr) for rr in restored_results]
         results = await asyncio.gather(*tasks)
         return results
@@ -716,6 +742,11 @@ async def main():
             print(f"  Total time: {disagg_result.total_time_sec:.1f}s")
             print(f"  Throughput: {disagg_result.requests_per_sec:.1f} req/s")
             print(f"  Cache hit rate: {disagg_result.cache_hit_rate*100:.0f}%")
+            
+            # Report any errors
+            failed = disagg_result.total_requests - disagg_result.successful_requests
+            if failed > 0:
+                print(f"  ⚠️  {failed} requests failed")
         finally:
             await runner.close()
     

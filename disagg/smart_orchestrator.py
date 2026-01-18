@@ -82,7 +82,7 @@ class ServerConfig:
     kv_cache_dir: str = "/tmp/llama_kv_cache"
     
     # Slot counts - should match server -np settings
-    prefill_slots: int = 2  # Prefill server slots
+    prefill_slots: int = 4  # Prefill server slots (dual GPU mode)
     decode_slots: int = 8   # Decode server slots
 
 
