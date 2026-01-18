@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+Concurrent Benchmark for Disaggregated Prefill
+
+Tests the scenario where disaggregated prefill should help:
+- High Input Sequence Length (ISL): Long prompts
+- Small Output Sequence Length (OSL): Short generations
+- High Concurrency: Many simultaneous requests
+
+Usage:
+    python3 disagg/concurrent_benchmark.py --concurrency 10 --prompt-tokens 1000 --output-tokens 20
+"""
+
+import argparse
+import asyncio
+import time
+import statistics
+import json
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+import aiohttp
+
+# Configuration
+ORCHESTRATOR_URL = "http://localhost:9000"
+BASELINE_URL = "http://localhost:8080"  # Direct to prefill server for baseline
+
+
+@dataclass
+class RequestResult:
+    """Result of a single request"""
+    request_id: int
+    success: bool
+    total_time_ms: float
+    prefill_time_ms: float = 0
+    transfer_time_ms: float = 0
+    decode_time_ms: float = 0
+    cache_n: int = 0
+    prompt_n: int = 0
+    tokens_generated: int = 0
+    error: str = ""
+
+
+@dataclass
+class BenchmarkResult:
+    """Aggregate benchmark results"""
+    mode: str
+    concurrency: int
+    n_requests: int
+    prompt_tokens: int
+    output_tokens: int
+    
+    # Timing stats
+    total_time_sec: float = 0
+    avg_latency_ms: float = 0
+    p50_latency_ms: float = 0
+    p90_latency_ms: float = 0
+    p99_latency_ms: float = 0
+    min_latency_ms: float = 0
+    max_latency_ms: float = 0
+    
+    # Throughput
+    requests_per_sec: float = 0
+    tokens_per_sec: float = 0
+    
+    # Cache stats (for disagg)
+    avg_cache_n: float = 0
+    cache_hit_rate: float = 0
+    
+    # Success rate
+    success_count: int = 0
+    failure_count: int = 0
+    
+    results: List[RequestResult] = field(default_factory=list)
+
+
+def generate_long_prompt(target_tokens: int) -> str:
+    """Generate a prompt that's approximately target_tokens long"""
+    # Each word is roughly 1-2 tokens, so use ~0.75 words per token
+    base_text = """
+    Please analyze the following complex scenario in detail. Consider all aspects carefully.
+    
+    In a large distributed computing environment, we need to optimize the allocation of 
+    computational resources across multiple data centers. Each data center has different 
+    capabilities, costs, and latency characteristics. The workload consists of various 
+    types of tasks including real-time processing, batch analytics, machine learning 
+    inference, and data storage operations.
+    
+    The system must handle variable load patterns throughout the day, with peak usage 
+    during business hours and lower utilization during nights and weekends. Cost 
+    optimization is important, but we must also maintain strict SLAs for response times 
+    and availability. The infrastructure includes a mix of on-premises servers, cloud 
+    instances, and edge computing nodes.
+    
+    Key considerations include network bandwidth between locations, data locality 
+    requirements, failover capabilities, and the need for geographic redundancy. 
+    Some workloads are stateless and can be easily migrated, while others require 
+    persistent state and careful coordination during any migration.
+    
+    Additionally, we must consider security requirements, compliance regulations, 
+    and the environmental impact of our computing choices. Energy efficiency and 
+    carbon footprint are increasingly important factors in infrastructure decisions.
+    """
+    
+    # Repeat to reach target length
+    words_needed = int(target_tokens * 0.75)
+    base_words = base_text.split()
+    
+    result_words = []
+    while len(result_words) < words_needed:
+        result_words.extend(base_words)
+    
+    return " ".join(result_words[:words_needed])
+
+
+async def make_baseline_request(
+    session: aiohttp.ClientSession,
+    request_id: int,
+    prompt: str,
+    n_predict: int
+) -> RequestResult:
+    """Make a direct request to the baseline server"""
+    t_start = time.perf_counter()
+    
+    try:
+        async with session.post(
+            f"{BASELINE_URL}/completion",
+            json={
+                "prompt": prompt,
+                "n_predict": n_predict,
+                "temperature": 0.7,
+            },
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as resp:
+            if resp.status != 200:
+                return RequestResult(
+                    request_id=request_id,
+                    success=False,
+                    total_time_ms=(time.perf_counter() - t_start) * 1000,
+                    error=f"HTTP {resp.status}"
+                )
+            
+            result = await resp.json()
+            t_end = time.perf_counter()
+            
+            timings = result.get("timings", {})
+            
+            return RequestResult(
+                request_id=request_id,
+                success=True,
+                total_time_ms=(t_end - t_start) * 1000,
+                prefill_time_ms=timings.get("prompt_ms", 0),
+                decode_time_ms=timings.get("predicted_ms", 0),
+                tokens_generated=result.get("tokens_predicted", 0),
+                prompt_n=timings.get("prompt_n", 0),
+            )
+    
+    except Exception as e:
+        return RequestResult(
+            request_id=request_id,
+            success=False,
+            total_time_ms=(time.perf_counter() - t_start) * 1000,
+            error=str(e)
+        )
+
+
+async def make_disagg_request(
+    session: aiohttp.ClientSession,
+    request_id: int,
+    prompt: str,
+    n_predict: int
+) -> RequestResult:
+    """Make a request through the disaggregated orchestrator"""
+    t_start = time.perf_counter()
+    
+    try:
+        async with session.post(
+            f"{ORCHESTRATOR_URL}/completion",
+            json={
+                "prompt": prompt,
+                "n_predict": n_predict,
+                "temperature": 0.7,
+                "disagg": True,
+                "session_id": f"bench_{request_id}_{int(time.time()*1000)}",
+            },
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                return RequestResult(
+                    request_id=request_id,
+                    success=False,
+                    total_time_ms=(time.perf_counter() - t_start) * 1000,
+                    error=f"HTTP {resp.status}: {error_text[:100]}"
+                )
+            
+            result = await resp.json()
+            t_end = time.perf_counter()
+            
+            metrics = result.get("disagg_metrics", {})
+            
+            return RequestResult(
+                request_id=request_id,
+                success=True,
+                total_time_ms=(t_end - t_start) * 1000,
+                prefill_time_ms=metrics.get("prefill_time_ms", 0),
+                transfer_time_ms=metrics.get("transfer_time_ms", 0),
+                decode_time_ms=metrics.get("decode_time_ms", 0),
+                cache_n=metrics.get("cache_n", 0),
+                prompt_n=metrics.get("prompt_n", 0),
+                tokens_generated=metrics.get("n_generated_tokens", 0),
+            )
+    
+    except Exception as e:
+        return RequestResult(
+            request_id=request_id,
+            success=False,
+            total_time_ms=(time.perf_counter() - t_start) * 1000,
+            error=str(e)
+        )
+
+
+async def run_benchmark(
+    mode: str,  # "baseline" or "disagg"
+    concurrency: int,
+    n_requests: int,
+    prompt: str,
+    output_tokens: int,
+    prompt_tokens: int,
+) -> BenchmarkResult:
+    """Run benchmark with specified concurrency"""
+    
+    result = BenchmarkResult(
+        mode=mode,
+        concurrency=concurrency,
+        n_requests=n_requests,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+    )
+    
+    # Clear orchestrator sessions before disagg test
+    if mode == "disagg":
+        async with aiohttp.ClientSession() as session:
+            try:
+                await session.post(f"{ORCHESTRATOR_URL}/clear")
+            except:
+                pass
+    
+    # Create semaphore for concurrency control
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async def bounded_request(session: aiohttp.ClientSession, request_id: int):
+        async with semaphore:
+            if mode == "baseline":
+                return await make_baseline_request(session, request_id, prompt, output_tokens)
+            else:
+                return await make_disagg_request(session, request_id, prompt, output_tokens)
+    
+    # Run all requests
+    connector = aiohttp.TCPConnector(limit=concurrency * 2)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        t_start = time.perf_counter()
+        
+        tasks = [bounded_request(session, i) for i in range(n_requests)]
+        results = await asyncio.gather(*tasks)
+        
+        t_end = time.perf_counter()
+        result.total_time_sec = t_end - t_start
+    
+    # Analyze results
+    result.results = results
+    successful = [r for r in results if r.success]
+    failed = [r for r in results if not r.success]
+    
+    result.success_count = len(successful)
+    result.failure_count = len(failed)
+    
+    if successful:
+        latencies = [r.total_time_ms for r in successful]
+        latencies.sort()
+        
+        result.avg_latency_ms = statistics.mean(latencies)
+        result.min_latency_ms = min(latencies)
+        result.max_latency_ms = max(latencies)
+        result.p50_latency_ms = latencies[len(latencies) // 2]
+        result.p90_latency_ms = latencies[int(len(latencies) * 0.9)]
+        result.p99_latency_ms = latencies[int(len(latencies) * 0.99)] if len(latencies) >= 100 else latencies[-1]
+        
+        # Throughput
+        total_tokens = sum(r.tokens_generated for r in successful)
+        result.requests_per_sec = len(successful) / result.total_time_sec
+        result.tokens_per_sec = total_tokens / result.total_time_sec
+        
+        # Cache stats (disagg only)
+        if mode == "disagg":
+            cache_ns = [r.cache_n for r in successful]
+            result.avg_cache_n = statistics.mean(cache_ns) if cache_ns else 0
+            result.cache_hit_rate = sum(1 for c in cache_ns if c > 0) / len(cache_ns) if cache_ns else 0
+    
+    return result
+
+
+def print_results(baseline: BenchmarkResult, disagg: BenchmarkResult):
+    """Print comparison of results"""
+    
+    print("\n" + "="*80)
+    print("CONCURRENT BENCHMARK RESULTS")
+    print("="*80)
+    
+    print(f"\nConfiguration:")
+    print(f"  Concurrency:    {baseline.concurrency}")
+    print(f"  Requests:       {baseline.n_requests}")
+    print(f"  Prompt tokens:  ~{baseline.prompt_tokens}")
+    print(f"  Output tokens:  {baseline.output_tokens}")
+    
+    print("\n" + "-"*80)
+    print(f"{'Metric':<30} {'Baseline':>20} {'Disaggregated':>20}")
+    print("-"*80)
+    
+    def fmt(val, unit=""):
+        if isinstance(val, float):
+            return f"{val:.1f}{unit}"
+        return f"{val}{unit}"
+    
+    print(f"{'Total Time':<30} {fmt(baseline.total_time_sec, 's'):>20} {fmt(disagg.total_time_sec, 's'):>20}")
+    print(f"{'Success/Fail':<30} {f'{baseline.success_count}/{baseline.failure_count}':>20} {f'{disagg.success_count}/{disagg.failure_count}':>20}")
+    print()
+    print(f"{'Avg Latency':<30} {fmt(baseline.avg_latency_ms, 'ms'):>20} {fmt(disagg.avg_latency_ms, 'ms'):>20}")
+    print(f"{'P50 Latency':<30} {fmt(baseline.p50_latency_ms, 'ms'):>20} {fmt(disagg.p50_latency_ms, 'ms'):>20}")
+    print(f"{'P90 Latency':<30} {fmt(baseline.p90_latency_ms, 'ms'):>20} {fmt(disagg.p90_latency_ms, 'ms'):>20}")
+    print(f"{'P99 Latency':<30} {fmt(baseline.p99_latency_ms, 'ms'):>20} {fmt(disagg.p99_latency_ms, 'ms'):>20}")
+    print(f"{'Min Latency':<30} {fmt(baseline.min_latency_ms, 'ms'):>20} {fmt(disagg.min_latency_ms, 'ms'):>20}")
+    print(f"{'Max Latency':<30} {fmt(baseline.max_latency_ms, 'ms'):>20} {fmt(disagg.max_latency_ms, 'ms'):>20}")
+    print()
+    print(f"{'Requests/sec':<30} {fmt(baseline.requests_per_sec):>20} {fmt(disagg.requests_per_sec):>20}")
+    print(f"{'Tokens/sec':<30} {fmt(baseline.tokens_per_sec):>20} {fmt(disagg.tokens_per_sec):>20}")
+    print()
+    print(f"{'Avg Cache Reuse (disagg)':<30} {'-':>20} {fmt(disagg.avg_cache_n, ' tokens'):>20}")
+    print(f"{'Cache Hit Rate (disagg)':<30} {'-':>20} {fmt(disagg.cache_hit_rate * 100, '%'):>20}")
+    
+    print("\n" + "-"*80)
+    
+    # Summary
+    if baseline.avg_latency_ms > 0 and disagg.avg_latency_ms > 0:
+        latency_ratio = baseline.avg_latency_ms / disagg.avg_latency_ms
+        throughput_ratio = disagg.requests_per_sec / baseline.requests_per_sec if baseline.requests_per_sec > 0 else 0
+        
+        print("\nSUMMARY:")
+        if latency_ratio > 1:
+            print(f"  ✓ Disaggregated is {latency_ratio:.2f}x FASTER (avg latency)")
+        else:
+            print(f"  ✗ Disaggregated is {1/latency_ratio:.2f}x SLOWER (avg latency)")
+        
+        if throughput_ratio > 1:
+            print(f"  ✓ Disaggregated has {throughput_ratio:.2f}x HIGHER throughput")
+        else:
+            print(f"  ✗ Disaggregated has {1/throughput_ratio:.2f}x LOWER throughput")
+        
+        if disagg.cache_hit_rate > 0.9:
+            print(f"  ✓ Cache hit rate: {disagg.cache_hit_rate*100:.0f}% - KV cache reuse working!")
+        elif disagg.cache_hit_rate > 0:
+            print(f"  ~ Cache hit rate: {disagg.cache_hit_rate*100:.0f}% - Partial cache reuse")
+        else:
+            print(f"  ✗ Cache hit rate: 0% - No cache reuse")
+    
+    print("="*80)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Concurrent Benchmark for Disaggregated Prefill")
+    parser.add_argument("--concurrency", "-c", type=int, default=5,
+                        help="Number of concurrent requests (default: 5)")
+    parser.add_argument("--requests", "-n", type=int, default=20,
+                        help="Total number of requests (default: 20)")
+    parser.add_argument("--prompt-tokens", "-p", type=int, default=500,
+                        help="Approximate prompt length in tokens (default: 500)")
+    parser.add_argument("--output-tokens", "-o", type=int, default=20,
+                        help="Number of tokens to generate (default: 20)")
+    parser.add_argument("--baseline-only", action="store_true",
+                        help="Only run baseline test")
+    parser.add_argument("--disagg-only", action="store_true",
+                        help="Only run disaggregated test")
+    
+    args = parser.parse_args()
+    
+    print("""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║           CONCURRENT BENCHMARK: Disaggregated vs Baseline                    ║
+║                                                                              ║
+║  Testing scenario: High ISL (long prompts) + Low OSL (short outputs)         ║
+║  This is where disaggregated prefill should provide benefits.                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+    """)
+    
+    # Generate test prompt
+    print(f"Generating prompt with ~{args.prompt_tokens} tokens...")
+    prompt = generate_long_prompt(args.prompt_tokens)
+    print(f"  Prompt length: {len(prompt)} chars (~{len(prompt.split())} words)")
+    
+    # Check servers are up
+    print("\nChecking servers...")
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"{BASELINE_URL}/health") as resp:
+                if resp.status == 200:
+                    print(f"  ✓ Baseline server (8080) is up")
+                else:
+                    print(f"  ✗ Baseline server returned {resp.status}")
+                    return
+        except Exception as e:
+            print(f"  ✗ Cannot connect to baseline server: {e}")
+            return
+        
+        if not args.baseline_only:
+            try:
+                async with session.get(f"{ORCHESTRATOR_URL}/health") as resp:
+                    if resp.status == 200:
+                        print(f"  ✓ Orchestrator (9000) is up")
+                    else:
+                        print(f"  ✗ Orchestrator returned {resp.status}")
+                        return
+            except Exception as e:
+                print(f"  ✗ Cannot connect to orchestrator: {e}")
+                return
+    
+    baseline_result = None
+    disagg_result = None
+    
+    # Run baseline
+    if not args.disagg_only:
+        print(f"\n{'='*60}")
+        print("Running BASELINE benchmark...")
+        print(f"{'='*60}")
+        baseline_result = await run_benchmark(
+            mode="baseline",
+            concurrency=args.concurrency,
+            n_requests=args.requests,
+            prompt=prompt,
+            output_tokens=args.output_tokens,
+            prompt_tokens=args.prompt_tokens,
+        )
+        print(f"  Completed: {baseline_result.success_count}/{args.requests} successful")
+        print(f"  Total time: {baseline_result.total_time_sec:.1f}s")
+        print(f"  Avg latency: {baseline_result.avg_latency_ms:.0f}ms")
+    
+    # Run disaggregated
+    if not args.baseline_only:
+        print(f"\n{'='*60}")
+        print("Running DISAGGREGATED benchmark...")
+        print(f"{'='*60}")
+        disagg_result = await run_benchmark(
+            mode="disagg",
+            concurrency=args.concurrency,
+            n_requests=args.requests,
+            prompt=prompt,
+            output_tokens=args.output_tokens,
+            prompt_tokens=args.prompt_tokens,
+        )
+        print(f"  Completed: {disagg_result.success_count}/{args.requests} successful")
+        print(f"  Total time: {disagg_result.total_time_sec:.1f}s")
+        print(f"  Avg latency: {disagg_result.avg_latency_ms:.0f}ms")
+        print(f"  Cache hit rate: {disagg_result.cache_hit_rate*100:.0f}%")
+    
+    # Print comparison
+    if baseline_result and disagg_result:
+        print_results(baseline_result, disagg_result)
+    elif baseline_result:
+        print(f"\n\nBaseline only results:")
+        print(f"  Avg latency: {baseline_result.avg_latency_ms:.0f}ms")
+        print(f"  Throughput: {baseline_result.requests_per_sec:.1f} req/s")
+    elif disagg_result:
+        print(f"\n\nDisaggregated only results:")
+        print(f"  Avg latency: {disagg_result.avg_latency_ms:.0f}ms")
+        print(f"  Cache hit rate: {disagg_result.cache_hit_rate*100:.0f}%")
+        print(f"  Throughput: {disagg_result.requests_per_sec:.1f} req/s")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
