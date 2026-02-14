@@ -57,6 +57,10 @@ class SparkConfig:
     # Transfer method: "scp", "rsync", or "nc" (netcat for raw speed)
     transfer_method: str = "scp"
 
+    # Use SSH ControlMaster alias (e.g., "spark2") for fast transfers
+    # Set up with: ssh -fN spark2 (after configuring ~/.ssh/config)
+    decode_ssh_alias: str = ""  # e.g., "spark2" for ControlMaster
+
 
 @dataclass
 class RequestMetrics:
@@ -134,7 +138,9 @@ class DistributedOrchestrator:
                 # Orchestrator is on the prefill machine (local file)
                 src = src_path
 
-            dst = f"{cfg.decode_ssh}:{dst_path}"
+            # Use ControlMaster alias if available (much faster)
+            scp_target = cfg.decode_ssh_alias or cfg.decode_ssh
+            dst = f"{scp_target}:{dst_path}"
 
             proc = await asyncio.create_subprocess_exec(
                 "scp", "-o", "StrictHostKeyChecking=no",

@@ -35,6 +35,12 @@ N_SLOTS="${N_SLOTS:-2}"
 # KV cache directory (on each machine)
 KV_CACHE_DIR="/tmp/llama_kv_cache"
 
+# === SSH ControlMaster ===
+# For fast KV cache transfer, set up persistent SSH on Spark 1:
+#   ssh -fN spark2
+# This uses the alias defined in ~/.ssh/config with ControlMaster auto
+DECODE_SSH_ALIAS="spark2"
+
 # === Derived URLs ===
 PREFILL_URL="http://${PREFILL_IP}:${PREFILL_PORT}"
 DECODE_URL="http://${DECODE_IP}:${DECODE_PORT}"

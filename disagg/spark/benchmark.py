@@ -32,7 +32,7 @@ import aiohttp
 # Default: high-speed interconnect IPs
 PREFILL_URL = os.environ.get("PREFILL_URL", "http://192.168.200.13:8080")
 DECODE_URL = os.environ.get("DECODE_URL", "http://192.168.200.12:8081")
-DECODE_SSH = os.environ.get("DECODE_SSH", "nvidia@192.168.200.12")
+DECODE_SSH = os.environ.get("DECODE_SSH", "spark2")
 PREFILL_SSH = os.environ.get("PREFILL_SSH", "")  # Empty = local
 KV_CACHE_DIR = "/tmp/llama_kv_cache"
 
@@ -67,22 +67,7 @@ async def scp_transfer(filename: str) -> tuple[float, int]:
     else:
         src = src_path
 
-    t_start = time.perf_counter()
-    proc = await asyncio.create_subprocess_exec(
-        "scp", "-o", "StrictHostKeyChecking=no",
-        "-o", "Compression=no",
-        "-c", "aes128-gcm@openssh.com",
-        src, dst,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    transfer_ms = (time.perf_counter() - t_start) * 1000
-
-    if proc.returncode != 0:
-        raise Exception(f"SCP failed: {stderr.decode()}")
-
-    # Get file size
+    # Get file size first (before transfer, for accurate bandwidth calc)
     try:
         if PREFILL_SSH:
             proc = await asyncio.create_subprocess_exec(
@@ -98,6 +83,20 @@ async def scp_transfer(filename: str) -> tuple[float, int]:
         file_size = int(stdout.decode().strip())
     except Exception:
         file_size = 0
+
+    t_start = time.perf_counter()
+    proc = await asyncio.create_subprocess_exec(
+        "scp", "-o", "StrictHostKeyChecking=no",
+        "-o", "Compression=no",
+        src, dst,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    transfer_ms = (time.perf_counter() - t_start) * 1000
+
+    if proc.returncode != 0:
+        raise Exception(f"SCP failed: {stderr.decode()}")
 
     return transfer_ms, file_size
 
