@@ -28,7 +28,6 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER,
     SERVER_TASK_TYPE_SLOT_IMPORT_BUFFER,
-    SERVER_TASK_TYPE_SLOT_PUSH,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -147,10 +146,8 @@ struct server_task {
         int slot_id;
         std::string filename;
         std::string filepath;
-        // for buffer-based KV transfer (export/import/push)
+        // for buffer-based KV transfer (export/import)
         std::shared_ptr<std::vector<uint8_t>> kv_buffer;
-        std::string target_url; // for push: URL of decode server
-        int target_slot = 0;    // for push: target slot ID
     };
     slot_action slot_action;
 
