@@ -12,6 +12,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <cpp-httplib/httplib.h>
+
 #include <cstddef>
 #include <cinttypes>
 #include <memory>
@@ -3545,6 +3547,19 @@ void server_routes::init_routes() {
         return handle_slots_import_buffer(req, id_slot);
     };
 
+    this->post_slot_kv_push = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::string id_slot_str = req.get_param("id_slot");
+        int id_slot;
+        try {
+            id_slot = std::stoi(id_slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_slots_push(req, id_slot);
+    };
+
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
 
@@ -4216,6 +4231,156 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_import_buffer(
     }
 
     res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_push(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    // parse JSON body for target info
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception &) {
+        res->error(format_error_response("Invalid JSON body", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const std::string target_url = json_value(body, "target_url", std::string(""));
+    const int target_slot        = json_value(body, "target_slot", 0);
+
+    if (target_url.empty()) {
+        res->error(format_error_response("Missing required field: target_url", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const int64_t t_total_start = ggml_time_us();
+
+    // Step 1: Export KV cache to buffer (via task queue)
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER);
+        task.id = rd.get_new_id();
+        task.slot_action.slot_id = id_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    auto * export_result = dynamic_cast<server_task_result_slot_export*>(result.get());
+    GGML_ASSERT(export_result != nullptr);
+
+    const double export_ms   = export_result->t_ms;
+    const size_t n_tokens    = export_result->n_tokens;
+    const size_t n_kv_bytes  = export_result->n_kv_bytes;
+    const size_t buffer_size = export_result->kv_buffer->size();
+
+    SRV_INF("push: exported slot %d, %zu tokens, %zu KV bytes, %.2f ms\n",
+            id_slot, n_tokens, n_kv_bytes, export_ms);
+
+    // Step 2: POST buffer directly to decode server
+    const int64_t t_transfer_start = ggml_time_us();
+
+    // parse target URL to extract host and port
+    std::string host = target_url;
+    int port = 80;
+
+    // strip protocol prefix
+    if (host.find("http://") == 0) {
+        host = host.substr(7);
+    } else if (host.find("https://") == 0) {
+        host = host.substr(8);
+        port = 443;
+    }
+
+    // extract port if present
+    auto colon_pos = host.find(':');
+    if (colon_pos != std::string::npos) {
+        port = std::stoi(host.substr(colon_pos + 1));
+        host = host.substr(0, colon_pos);
+    }
+
+    // strip trailing slash
+    if (!host.empty() && host.back() == '/') {
+        host.pop_back();
+    }
+
+    httplib::Client cli(host, port);
+    cli.set_connection_timeout(5, 0); // 5 seconds
+    cli.set_read_timeout(300, 0);     // 5 minutes for large KV caches
+    cli.set_write_timeout(300, 0);
+
+    const std::string push_path = "/slots/" + std::to_string(target_slot) + "/kv-data";
+    auto & buf = export_result->kv_buffer;
+
+    auto http_result = cli.Post(
+        push_path,
+        reinterpret_cast<const char *>(buf->data()),
+        buf->size(),
+        "application/octet-stream"
+    );
+
+    const int64_t t_transfer_end = ggml_time_us();
+    const double transfer_ms = (t_transfer_end - t_transfer_start) / 1000.0;
+
+    if (!http_result) {
+        const std::string err_msg = "Push failed: HTTP request to " + target_url + push_path +
+                                    " failed: " + httplib::to_string(http_result.error());
+        SRV_ERR("%s\n", err_msg.c_str());
+        res->error(format_error_response(err_msg, ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    if (http_result->status != 200) {
+        const std::string err_msg = "Push failed: target returned HTTP " +
+                                    std::to_string(http_result->status) + ": " + http_result->body;
+        SRV_ERR("%s\n", err_msg.c_str());
+        res->error(format_error_response(err_msg, ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    // parse import timing from target's response
+    double import_ms = 0.0;
+    try {
+        json target_response = json::parse(http_result->body);
+        if (target_response.contains("timings") && target_response["timings"].contains("import_ms")) {
+            import_ms = target_response["timings"]["import_ms"].get<double>();
+        }
+    } catch (...) {
+        // ignore parse errors, import_ms stays 0
+    }
+
+    const int64_t t_total_end = ggml_time_us();
+    const double total_ms = (t_total_end - t_total_start) / 1000.0;
+    const double throughput_gbps = (buffer_size * 8.0) / (transfer_ms * 1e6);
+
+    SRV_INF("push: transferred %zu bytes to %s in %.2f ms (%.2f Gbps), import %.2f ms, total %.2f ms\n",
+            buffer_size, target_url.c_str(), transfer_ms, throughput_gbps, import_ms, total_ms);
+
+    json response = {
+        { "id_slot",      id_slot },
+        { "target_url",   target_url },
+        { "target_slot",  target_slot },
+        { "n_tokens",     n_tokens },
+        { "n_kv_bytes",   n_kv_bytes },
+        { "buffer_size",  buffer_size },
+        { "throughput_gbps", throughput_gbps },
+        { "timings", {
+            { "export_ms",   export_ms },
+            { "transfer_ms", transfer_ms },
+            { "import_ms",   import_ms },
+            { "total_ms",    total_ms },
+        }},
+    };
+    res->ok(response);
     return res;
 }
 
