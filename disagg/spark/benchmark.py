@@ -321,6 +321,97 @@ async def disagg_completion_buffer(
     )
 
 
+async def disagg_completion_push(
+    session: aiohttp.ClientSession,
+    prompt: str,
+    n_predict: int = 50,
+    session_id: str = "test",
+) -> TimingResult:
+    """Disaggregated using direct server-to-server push (single hop)."""
+    total_start = time.perf_counter()
+
+    # Clear decode slot
+    try:
+        async with session.post(f"{DECODE_URL}/slots/0?action=erase") as resp:
+            pass
+    except Exception:
+        pass
+
+    # Step 1: Prefill
+    t0 = time.perf_counter()
+    async with session.post(
+        f"{PREFILL_URL}/completion",
+        json={
+            "prompt": prompt,
+            "n_predict": 0,
+            "cache_prompt": True,
+            "id_slot": 0,
+        }
+    ) as resp:
+        if resp.status != 200:
+            raise Exception(f"Prefill failed: {await resp.text()}")
+        prefill_data = await resp.json()
+    prefill_ms = (time.perf_counter() - t0) * 1000
+    prompt_tokens = prefill_data.get("timings", {}).get("prompt_n", 0)
+
+    # Step 2: Push KV cache directly from prefill server to decode server
+    t0 = time.perf_counter()
+    async with session.post(
+        f"{PREFILL_URL}/slots/0/kv-data/push",
+        json={
+            "target_url": DECODE_URL,
+            "target_slot": 0,
+        }
+    ) as resp:
+        if resp.status != 200:
+            raise Exception(f"Push failed: {await resp.text()}")
+        push_data = await resp.json()
+    push_ms = (time.perf_counter() - t0) * 1000
+    push_timings = push_data.get("timings", {})
+    transfer_bytes = push_data.get("buffer_size", 0)
+    export_ms = push_timings.get("export_ms", 0)
+    transfer_ms = push_timings.get("transfer_ms", 0)
+    import_ms = push_timings.get("import_ms", 0)
+    push_total_ms = push_timings.get("total_ms", 0)
+    gbps = push_data.get("throughput_gbps", 0)
+    print(f"    Push: {transfer_bytes/1e6:.1f}MB, export={export_ms:.0f}ms, "
+          f"transfer={transfer_ms:.0f}ms, import={import_ms:.0f}ms, "
+          f"total={push_total_ms:.0f}ms ({gbps:.1f} Gbps)")
+
+    # Step 3: Decode
+    t0 = time.perf_counter()
+    async with session.post(
+        f"{DECODE_URL}/completion",
+        json={
+            "prompt": prompt,
+            "n_predict": n_predict,
+            "cache_prompt": True,
+            "id_slot": 0,
+        }
+    ) as resp:
+        if resp.status != 200:
+            raise Exception(f"Decode failed: {await resp.text()}")
+        decode_data = await resp.json()
+    decode_ms = (time.perf_counter() - t0) * 1000
+    decode_timings = decode_data.get("timings", {})
+    cache_hit = decode_timings.get("prompt_n", 0) == 0 or decode_timings.get("prompt_ms", 0) < 10
+
+    total_ms = (time.perf_counter() - total_start) * 1000
+
+    return TimingResult(
+        total_ms=total_ms,
+        prefill_ms=prefill_ms,
+        save_ms=export_ms,        # export (serialize)
+        transfer_ms=transfer_ms,  # network transfer
+        restore_ms=import_ms,     # import (deserialize on target)
+        decode_ms=decode_ms,
+        tokens_generated=decode_timings.get("predicted_n", 0),
+        prompt_tokens=prompt_tokens,
+        transfer_bytes=transfer_bytes,
+        cache_hit=cache_hit,
+    )
+
+
 def print_result(name: str, r: TimingResult):
     print(f"\n{name}:")
     print(f"  Total:        {r.total_ms:8.1f} ms")
@@ -385,11 +476,19 @@ async def run_benchmark(prompt: str, n_predict: int = 50, num_runs: int = 3, mod
             print(f"  Run {i+1}: {r.total_ms:.1f}ms total, {r.prefill_ms:.1f}ms prefill, "
                   f"{r.decode_ms:.1f}ms decode")
 
-        modes_to_run = [mode] if mode != "both" else ["scp", "buffer"]
+        mode_map = {
+            "scp": ["scp"],
+            "buffer": ["buffer"],
+            "push": ["push"],
+            "both": ["scp", "buffer"],
+            "all": ["scp", "buffer", "push"],
+        }
+        modes_to_run = mode_map.get(mode, [mode])
         all_disagg = {}
 
         for m in modes_to_run:
-            label = "SCP (file-based)" if m == "scp" else "HTTP BUFFER (in-memory)"
+            labels = {"scp": "SCP (file-based)", "buffer": "HTTP BUFFER (double-hop)", "push": "HTTP PUSH (direct)"}
+            label = labels.get(m, m)
             print("\n" + "-" * 70)
             print(f"DISAGGREGATED - {label}")
             print("-" * 70)
@@ -403,6 +502,8 @@ async def run_benchmark(prompt: str, n_predict: int = 50, num_runs: int = 3, mod
                         pass
                 if m == "scp":
                     r = await disagg_completion(session, prompt, n_predict, session_id=f"run_{i}")
+                elif m == "push":
+                    r = await disagg_completion_push(session, prompt, n_predict, session_id=f"run_{i}")
                 else:
                     r = await disagg_completion_buffer(session, prompt, n_predict, session_id=f"run_{i}")
                 disagg_results.append(r)
@@ -421,7 +522,8 @@ async def run_benchmark(prompt: str, n_predict: int = 50, num_runs: int = 3, mod
     print(f"\nBaseline avg:        {b_avg:8.1f} ms")
 
     for m, disagg_results in all_disagg.items():
-        label = "SCP" if m == "scp" else "Buffer"
+        labels = {"scp": "SCP", "buffer": "Buffer", "push": "Push"}
+        label = labels.get(m, m)
         d_avg = statistics.mean([r.total_ms for r in disagg_results])
 
         print(f"\nDisagg ({label}) avg:  {d_avg:8.1f} ms")
@@ -432,9 +534,9 @@ async def run_benchmark(prompt: str, n_predict: int = 50, num_runs: int = 3, mod
         print(f"\nDisagg ({label}) breakdown (avg):")
         print(f"  Prefill:           {statistics.mean([r.prefill_ms for r in disagg_results]):8.1f} ms")
         print(f"  Save/Export:       {statistics.mean([r.save_ms for r in disagg_results]):8.1f} ms")
-        print(f"  Transfer/Import:   {statistics.mean([r.transfer_ms for r in disagg_results]):8.1f} ms")
+        print(f"  Transfer:          {statistics.mean([r.transfer_ms for r in disagg_results]):8.1f} ms")
         if any(r.restore_ms > 0 for r in disagg_results):
-            print(f"  Restore:           {statistics.mean([r.restore_ms for r in disagg_results]):8.1f} ms")
+            print(f"  Restore/Import:    {statistics.mean([r.restore_ms for r in disagg_results]):8.1f} ms")
         print(f"  Decode:            {statistics.mean([r.decode_ms for r in disagg_results]):8.1f} ms")
 
         overhead = statistics.mean([r.save_ms + r.transfer_ms + r.restore_ms for r in disagg_results])
@@ -451,7 +553,8 @@ async def run_benchmark(prompt: str, n_predict: int = 50, num_runs: int = 3, mod
     print("Best results:")
     print_result("Baseline (best)", min(baseline_results, key=lambda r: r.total_ms))
     for m, disagg_results in all_disagg.items():
-        label = "SCP" if m == "scp" else "Buffer"
+        labels = {"scp": "SCP", "buffer": "Buffer", "push": "Push"}
+        label = labels.get(m, m)
         print_result(f"Disagg {label} (best)", min(disagg_results, key=lambda r: r.total_ms))
     print("=" * 70)
 
@@ -461,8 +564,8 @@ async def main():
     parser.add_argument("--prompt-tokens", type=int, default=2000)
     parser.add_argument("--output-tokens", type=int, default=50)
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--mode", choices=["scp", "buffer", "both"], default="buffer",
-                        help="Transfer mode: scp (file+SSH), buffer (HTTP binary), both")
+    parser.add_argument("--mode", choices=["scp", "buffer", "push", "both", "all"], default="push",
+                        help="Transfer mode: scp (file+SSH), buffer (HTTP double-hop), push (HTTP direct), both (scp+buffer), all")
     parser.add_argument("--prefill-url", type=str, default=None)
     parser.add_argument("--decode-url", type=str, default=None)
     parser.add_argument("--decode-ssh", type=str, default=None)
