@@ -309,7 +309,84 @@ async def run_disagg_batch(
     return await asyncio.gather(*tasks)
 
 
-async def run_sweep(concurrency_levels: List[int], isl: int, osl: int):
+async def run_disagg_push_batch(
+    session: aiohttp.ClientSession,
+    concurrency: int,
+    prompts: List[str],
+    osl: int,
+) -> List[RequestResult]:
+    """Run concurrent disagg requests using direct push (no SCP)."""
+
+    async def do_one(req_id: int) -> RequestResult:
+        r = RequestResult(request_id=req_id)
+        prompt = prompts[req_id % len(prompts)]
+        slot_id = req_id % 16
+
+        t0 = time.perf_counter()
+        try:
+            # 1. Prefill on Spark 1
+            t_pf = time.perf_counter()
+            async with session.post(f"{PREFILL_URL}/completion", json={
+                "prompt": prompt,
+                "n_predict": 0,
+                "cache_prompt": False,
+                "id_slot": slot_id,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Prefill HTTP {resp.status}: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                pf_data = await resp.json()
+            r.prefill_ms = (time.perf_counter() - t_pf) * 1000
+            r.prompt_tokens = pf_data.get("timings", {}).get("prompt_n", 0)
+
+            # 2. Push KV cache directly to decode server
+            t_push = time.perf_counter()
+            async with session.post(f"{PREFILL_URL}/slots/{slot_id}/kv-data/push", json={
+                "target_url": DECODE_URL,
+                "target_slot": slot_id,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Push failed: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                push_data = await resp.json()
+            push_ms = (time.perf_counter() - t_push) * 1000
+            push_timings = push_data.get("timings", {})
+            r.save_ms = push_timings.get("export_ms", 0)
+            r.transfer_ms = push_timings.get("transfer_ms", 0)
+            r.restore_ms = push_timings.get("import_ms", 0)
+            r.ttft_ms = r.prefill_ms + push_ms
+
+            # 3. Decode on Spark 2
+            t_dc = time.perf_counter()
+            async with session.post(f"{DECODE_URL}/completion", json={
+                "prompt": prompt,
+                "n_predict": osl,
+                "cache_prompt": True,
+                "id_slot": slot_id,
+                "temperature": 0.0,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Decode failed: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                dc_data = await resp.json()
+            r.decode_ms = (time.perf_counter() - t_dc) * 1000
+            r.tokens_generated = dc_data.get("timings", {}).get("predicted_n", 0)
+            r.success = True
+
+        except Exception as e:
+            r.error = str(e)
+
+        r.total_ms = (time.perf_counter() - t0) * 1000
+        return r
+
+    tasks = [do_one(i) for i in range(concurrency)]
+    return await asyncio.gather(*tasks)
+
+
+async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str = "push"):
     """Run the full concurrency sweep."""
 
     # Pre-generate unique prompts
@@ -361,9 +438,13 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int):
             await asyncio.sleep(1)
 
             # --- DISAGG ---
-            print(f"  Disagg (prefill Spark1 + decode Spark2)...", end="", flush=True)
+            disagg_label = "push" if mode == "push" else "SCP"
+            print(f"  Disagg [{disagg_label}] (prefill Spark1 + decode Spark2)...", end="", flush=True)
             t0 = time.perf_counter()
-            disagg_results = await run_disagg_batch(session, conc, prompts, osl)
+            if mode == "push":
+                disagg_results = await run_disagg_push_batch(session, conc, prompts, osl)
+            else:
+                disagg_results = await run_disagg_batch(session, conc, prompts, osl)
             disagg_wall = (time.perf_counter() - t0) * 1000
 
             dp = SweepPoint(concurrency=conc, mode="disagg", isl=isl, osl=osl,
@@ -378,22 +459,23 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int):
                 errors = [r.error for r in dp.results if not r.success]
                 print(f"    Errors: {errors[:3]}")
 
-            # Cleanup SCP files
-            try:
-                if PREFILL_SSH:
+            # Cleanup SCP files (only for SCP mode)
+            if mode == "scp":
+                try:
+                    if PREFILL_SSH:
+                        await asyncio.create_subprocess_exec(
+                            "ssh", PREFILL_SSH, f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                    else:
+                        p = await asyncio.create_subprocess_exec(
+                            "bash", "-c", f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                        await p.communicate()
                     await asyncio.create_subprocess_exec(
-                        "ssh", PREFILL_SSH, f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
+                        "ssh", DECODE_SSH, f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                else:
-                    p = await asyncio.create_subprocess_exec(
-                        "bash", "-c", f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                    await p.communicate()
-                await asyncio.create_subprocess_exec(
-                    "ssh", DECODE_SSH, f"rm -f {KV_CACHE_DIR}/sweep_*.bin",
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     return all_points
 
@@ -401,16 +483,16 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int):
 def print_summary(points: List[SweepPoint]):
     """Print the sweep summary table."""
 
-    print("\n\n" + "=" * 90)
+    print("\n\n" + "=" * 110)
     print("CONCURRENCY SWEEP RESULTS")
-    print("=" * 90)
+    print("=" * 110)
 
-    # Group by concurrency
     conc_levels = sorted(set(p.concurrency for p in points))
 
-    print(f"\n{'Conc':>5} | {'--- Baseline (1 GPU) ---':^36} | {'--- Disagg (2 GPUs) ---':^36} | {'Speedup':>8}")
-    print(f"{'':>5} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'':>8}")
-    print("-" * 90)
+    # Main throughput table
+    print(f"\n{'Conc':>5} | {'--- Baseline (1 GPU) ---':^36} | {'--- Disagg (2 GPUs) ---':^36} | {'Decode':>8} {'Speedup':>8}")
+    print(f"{'':>5} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'TPS spdup':>8} {'':>8}")
+    print("-" * 110)
 
     for conc in conc_levels:
         bp = next((p for p in points if p.concurrency == conc and p.mode == "baseline"), None)
@@ -419,7 +501,6 @@ def print_summary(points: List[SweepPoint]):
         if not bp or not dp:
             continue
 
-        # Calculate throughput as total_tokens / wall_time
         b_ok = len(bp.successful)
         d_ok = len(dp.successful)
         b_total_tok = sum(r.tokens_generated for r in bp.successful)
@@ -433,14 +514,49 @@ def print_summary(points: List[SweepPoint]):
 
         print(f"{conc:>5} | {bp.avg_total_ms:>8.0f} {bp.avg_ttft_ms:>9.0f} {b_tps:>8.1f} {b_ok:>4}/{conc:<3}"
               f" | {dp.avg_total_ms:>8.0f} {dp.avg_ttft_ms:>9.0f} {d_tps:>8.1f} {d_ok:>4}/{conc:<3}"
-              f" | {speedup:>7.2f}x")
+              f" | {speedup:>8.2f}x")
 
-    print("-" * 90)
+    print("-" * 110)
+
+    # Per-GPU TPS table
+    print(f"\nPer-GPU Throughput (tokens/sec):")
+    print(f"{'Conc':>5} | {'-- Baseline (1 GPU) --':^32} | {'---- Disagg (2 GPUs) ----':^42}")
+    print(f"{'':>5} | {'Prefill':>10} {'Decode':>10} {'Total':>10} | {'Prefill/GPU':>12} {'Decode/GPU':>12} {'Total':>10}")
+    print("-" * 85)
+
+    for conc in conc_levels:
+        bp = next((p for p in points if p.concurrency == conc and p.mode == "baseline"), None)
+        dp = next((p for p in points if p.concurrency == conc and p.mode == "disagg"), None)
+
+        if not bp or not dp or not bp.successful or not dp.successful:
+            continue
+
+        b_wall = bp.wall_time_ms / 1000 if bp.wall_time_ms > 0 else 1
+        d_wall = dp.wall_time_ms / 1000 if dp.wall_time_ms > 0 else 1
+
+        # Baseline: 1 GPU does both prefill and decode
+        b_prefill_tok = sum(r.prompt_tokens for r in bp.successful)
+        b_decode_tok = sum(r.tokens_generated for r in bp.successful)
+        b_pf_tps = b_prefill_tok / b_wall
+        b_dc_tps = b_decode_tok / b_wall
+        b_total_tps = (b_prefill_tok + b_decode_tok) / b_wall
+
+        # Disagg: GPU1 does prefill, GPU2 does decode (each is 1 GPU)
+        d_prefill_tok = sum(r.prompt_tokens for r in dp.successful)
+        d_decode_tok = sum(r.tokens_generated for r in dp.successful)
+        d_pf_tps = d_prefill_tok / d_wall  # per GPU (only 1 GPU doing prefill)
+        d_dc_tps = d_decode_tok / d_wall    # per GPU (only 1 GPU doing decode)
+        d_total_tps = (d_prefill_tok + d_decode_tok) / d_wall
+
+        print(f"{conc:>5} | {b_pf_tps:>10.0f} {b_dc_tps:>10.1f} {b_total_tps:>10.0f}"
+              f" | {d_pf_tps:>12.0f} {d_dc_tps:>12.1f} {d_total_tps:>10.0f}")
+
+    print("-" * 85)
 
     # Detailed breakdown for disagg
     print(f"\nDisagg breakdown (avg ms):")
-    print(f"{'Conc':>5} | {'Prefill':>8} {'Save':>8} {'Transfer':>8} {'Restore':>8} {'Decode':>8} | {'Overhead':>8}")
-    print("-" * 70)
+    print(f"{'Conc':>5} | {'Prefill':>8} {'Export':>8} {'Transfer':>8} {'Import':>8} {'Decode':>8} | {'Overhead':>8}")
+    print("-" * 75)
     for conc in conc_levels:
         dp = next((p for p in points if p.concurrency == conc and p.mode == "disagg"), None)
         if not dp or not dp.successful:
@@ -454,15 +570,17 @@ def print_summary(points: List[SweepPoint]):
         overhead = avg_sv + avg_xf + avg_rs
         print(f"{conc:>5} | {avg_pf:>8.0f} {avg_sv:>8.0f} {avg_xf:>8.0f} {avg_rs:>8.0f} {avg_dc:>8.0f} | {overhead:>8.0f}")
 
-    print("=" * 90)
+    print("=" * 110)
 
 
 async def main():
     parser = argparse.ArgumentParser(description="Concurrency Sweep Benchmark")
-    parser.add_argument("--concurrency", type=str, default="1,2,4,8,12,16",
+    parser.add_argument("--concurrency", type=str, default="1,2",
                         help="Comma-separated concurrency levels")
-    parser.add_argument("--isl", type=int, default=4000, help="Input sequence length (tokens)")
+    parser.add_argument("--isl", type=int, default=2000, help="Input sequence length (tokens)")
     parser.add_argument("--osl", type=int, default=128, help="Output sequence length (tokens)")
+    parser.add_argument("--mode", choices=["push", "scp"], default="push",
+                        help="Transfer mode: push (HTTP direct) or scp (file-based)")
     parser.add_argument("--prefill-url", type=str, default=None)
     parser.add_argument("--decode-url", type=str, default=None)
 
@@ -483,7 +601,7 @@ async def main():
     print(f"Concurrency levels: {conc_levels}")
     print(f"Baseline: {BASELINE_URL} (single GPU)")
     print(f"Disagg:   {PREFILL_URL} (prefill) + {DECODE_URL} (decode)")
-    print(f"Transfer: SCP via {DECODE_SSH}")
+    print(f"Transfer: {args.mode}")
 
     # Check servers
     timeout = aiohttp.ClientTimeout(total=5)
@@ -498,7 +616,7 @@ async def main():
                 print(f"  FAIL: {name} at {url} - {e}")
                 return
 
-    points = await run_sweep(conc_levels, args.isl, args.osl)
+    points = await run_sweep(conc_levels, args.isl, args.osl, mode=args.mode)
     print_summary(points)
 
     # Save raw results
