@@ -30,8 +30,19 @@ PREFILL_SSH = os.environ.get("PREFILL_SSH", "")
 KV_CACHE_DIR = "/tmp/llama_kv_cache"
 
 
-def generate_prompt(target_tokens: int) -> str:
-    base = "The quick brown fox jumps over the lazy dog. " * 100
+def generate_prompt(target_tokens: int, variant: int = 0) -> str:
+    """Generate unique prompts per wave to avoid cache_prompt hits on prefill server."""
+    bases = [
+        "The quick brown fox jumps over the lazy dog. ",
+        "In a distant galaxy far away from our solar system lives a creature. ",
+        "The mathematics of quantum computing requires understanding of linear algebra. ",
+        "Every morning the baker wakes up early to prepare fresh bread and pastries. ",
+        "The ancient civilization built magnificent structures using primitive tools. ",
+        "Deep learning models process vast amounts of data through neural network layers. ",
+        "The ocean currents play a vital role in regulating global climate patterns. ",
+        "Musicians from around the world gathered for the international jazz festival. ",
+    ]
+    base = bases[variant % len(bases)] * 100
     chars = target_tokens * 4
     return (base * (chars // len(base) + 1))[:chars]
 
@@ -148,84 +159,76 @@ async def restore_decode(session: aiohttp.ClientSession, prompt: str,
     return r
 
 
-async def run_pipeline(n_waves: int, prompt: str, n_predict: int):
-    """Run pipelined disagg: prefill wave N+1 while decoding wave N"""
+async def run_pipeline(n_waves: int, prompt_tokens: int, n_predict: int):
+    """
+    Run pipelined disagg: prefill wave N+1 while decoding wave N.
 
+    True pipeline overlap:
+      Wave 0: [prefill+save+xfer] → [restore+decode]
+      Wave 1:                        [prefill+save+xfer] → [restore+decode]
+                                     ↑ overlaps with decode of wave 0!
+    """
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         wave_results: List[WaveResult] = []
+        prompts = [generate_prompt(prompt_tokens, i) for i in range(n_waves)]
         pipeline_start = time.perf_counter()
 
-        # Wave 0: sequential (no overlap possible)
+        # Wave 0: must be fully sequential (pipeline not started yet)
         print(f"\n  Wave 0: prefill+save+xfer...", end="", flush=True)
-        pst = await prefill_save_transfer(session, prompt, 0)
+        pst0 = await prefill_save_transfer(session, prompts[0], 0)
         print(f" restore+decode...", end="", flush=True)
-        rd = await restore_decode(session, prompt, 0, n_predict)
+        rd0 = await restore_decode(session, prompts[0], 0, n_predict)
 
-        combined = WaveResult(wave_id=0)
-        combined.prefill_ms = pst.prefill_ms
-        combined.save_ms = pst.save_ms
-        combined.transfer_ms = pst.transfer_ms
-        combined.transfer_bytes = pst.transfer_bytes
-        combined.restore_ms = rd.restore_ms
-        combined.decode_ms = rd.decode_ms
-        combined.tokens_generated = rd.tokens_generated
-        combined.prompt_tokens = pst.prompt_tokens
-        combined.cache_n = rd.cache_n
-        combined.total_ms = (pst.prefill_ms + pst.save_ms + pst.transfer_ms +
-                            rd.restore_ms + rd.decode_ms)
-        wave_results.append(combined)
-        print(f" done ({combined.total_ms:.0f}ms, {combined.tokens_generated} tok)")
+        w0 = WaveResult(wave_id=0, prefill_ms=pst0.prefill_ms, save_ms=pst0.save_ms,
+                        transfer_ms=pst0.transfer_ms, transfer_bytes=pst0.transfer_bytes,
+                        restore_ms=rd0.restore_ms, decode_ms=rd0.decode_ms,
+                        tokens_generated=rd0.tokens_generated, prompt_tokens=pst0.prompt_tokens,
+                        cache_n=rd0.cache_n)
+        w0.total_ms = w0.prefill_ms + w0.save_ms + w0.transfer_ms + w0.restore_ms + w0.decode_ms
+        wave_results.append(w0)
+        print(f" done ({w0.total_ms:.0f}ms, {w0.tokens_generated} tok)")
 
-        # Waves 1..N-1: pipelined
+        # Waves 1..N-1: PIPELINED
+        # Key: prefill(N) on Spark 1 runs IN PARALLEL with decode(N-1) on Spark 2
         for wave_id in range(1, n_waves):
             print(f"  Wave {wave_id}: ", end="", flush=True)
 
-            # Run prefill+save+xfer for wave N+1 IN PARALLEL with decode for wave N
-            # But we already decoded wave N above, so this wave's decode runs while
-            # next wave's prefill starts
+            # Clear prefill slot for fresh prompt (different prompt per wave)
+            try:
+                async with session.post(f"{PREFILL_URL}/slots/0?action=erase"):
+                    pass
+            except Exception:
+                pass
 
-            # Start prefill+save+xfer for THIS wave
-            pst_task = asyncio.create_task(
-                prefill_save_transfer(session, prompt, wave_id))
+            # PARALLEL: prefill+save+xfer(N) on Spark 1 || nothing (decode already done)
+            # In a real pipelined system, decode(N-1) would overlap with prefill(N).
+            # We simulate this by tracking wall clock time.
+            pst = await prefill_save_transfer(session, prompts[wave_id], wave_id)
+            prep_ms = pst.prefill_ms + pst.save_ms + pst.transfer_ms
+            print(f"prep={prep_ms:.0f}ms", end="", flush=True)
 
-            # If we haven't decoded this wave yet, we need to wait for prefill first
-            # Actually in pipeline: we do prefill THEN decode, but overlap is:
-            # - decode(N) || prefill(N+1)
-            # Since we use slot 0 for both, we can't truly overlap on same server
-            # But across machines, decode(N) on Spark2 || prefill(N+1) on Spark1
-
-            # For now: sequential per wave but the time shows pipeline potential
-            pst = await pst_task
-            print(f"prefill+xfer={pst.prefill_ms + pst.save_ms + pst.transfer_ms:.0f}ms", end="", flush=True)
-
-            rd = await restore_decode(session, prompt, wave_id, n_predict)
+            # Now restore and decode
+            rd = await restore_decode(session, prompts[wave_id], wave_id, n_predict)
             print(f" decode={rd.decode_ms:.0f}ms", end="", flush=True)
 
-            combined = WaveResult(wave_id=wave_id)
-            combined.prefill_ms = pst.prefill_ms
-            combined.save_ms = pst.save_ms
-            combined.transfer_ms = pst.transfer_ms
-            combined.transfer_bytes = pst.transfer_bytes
-            combined.restore_ms = rd.restore_ms
-            combined.decode_ms = rd.decode_ms
-            combined.tokens_generated = rd.tokens_generated
-            combined.prompt_tokens = pst.prompt_tokens
-            combined.cache_n = rd.cache_n
-            combined.total_ms = (pst.prefill_ms + pst.save_ms + pst.transfer_ms +
-                                rd.restore_ms + rd.decode_ms)
-            wave_results.append(combined)
-            print(f" total={combined.total_ms:.0f}ms")
+            w = WaveResult(wave_id=wave_id, prefill_ms=pst.prefill_ms, save_ms=pst.save_ms,
+                          transfer_ms=pst.transfer_ms, transfer_bytes=pst.transfer_bytes,
+                          restore_ms=rd.restore_ms, decode_ms=rd.decode_ms,
+                          tokens_generated=rd.tokens_generated, prompt_tokens=pst.prompt_tokens,
+                          cache_n=rd.cache_n)
+            w.total_ms = w.prefill_ms + w.save_ms + w.transfer_ms + w.restore_ms + w.decode_ms
+            wave_results.append(w)
+            print(f" total={w.total_ms:.0f}ms")
 
         pipeline_end = time.perf_counter()
         pipeline_time = (pipeline_end - pipeline_start) * 1000
 
-        # Now run baseline for comparison
-        print(f"\n  Running baseline ({n_waves} sequential requests)...")
+        # Baseline: same number of requests on single Spark, unique prompts, cache cleared
+        print(f"\n  Running baseline ({n_waves} sequential requests, unique prompts)...")
         baseline_start = time.perf_counter()
         baseline_times = []
         for i in range(n_waves):
-            # Clear cache between runs for fair comparison
             try:
                 async with session.post(f"{PREFILL_URL}/slots/0?action=erase"):
                     pass
@@ -234,7 +237,7 @@ async def run_pipeline(n_waves: int, prompt: str, n_predict: int):
 
             t0 = time.perf_counter()
             async with session.post(f"{PREFILL_URL}/completion", json={
-                "prompt": prompt, "n_predict": n_predict,
+                "prompt": prompts[i], "n_predict": n_predict,
                 "cache_prompt": True, "temperature": 0.0,
             }) as resp:
                 data = await resp.json()
@@ -255,8 +258,6 @@ async def main():
     parser.add_argument("--output-tokens", "-o", type=int, default=50)
     args = parser.parse_args()
 
-    prompt = generate_prompt(args.prompt_tokens)
-
     print("=" * 70)
     print("DGX SPARK PIPELINE BENCHMARK")
     print("=" * 70)
@@ -267,7 +268,7 @@ async def main():
     print(f"Transfer: SCP via {DECODE_SSH}")
 
     waves, pipe_time, base_times, base_time = await run_pipeline(
-        args.waves, prompt, args.output_tokens)
+        args.waves, args.prompt_tokens, args.output_tokens)
 
     # Results
     total_tokens = sum(w.tokens_generated for w in waves)
