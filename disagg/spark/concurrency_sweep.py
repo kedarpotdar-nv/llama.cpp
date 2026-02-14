@@ -9,9 +9,15 @@ Theory:
 - At high concurrency: disagg wins because prefill and decode don't compete
   for the same GPU. Each GPU focuses on one task.
 
+Modes:
+- --rounds 1 (default): batch mode, send concurrency requests, wait for all
+- --rounds N: continuous pipeline mode, send N*concurrency total requests
+  with pipelined slot pools. Disagg releases prefill slot after push so new
+  prefills overlap with in-progress decodes (assembly line).
+
 Usage:
-    python3 disagg/spark/concurrency_sweep.py
-    python3 disagg/spark/concurrency_sweep.py --concurrency 1,2,4,8,16 --isl 4000 --osl 128
+    python3 disagg/spark/concurrency_sweep.py --rounds 10 --concurrency 4,8
+    python3 disagg/spark/concurrency_sweep.py --concurrency 1,2,4,8 --isl 2000 --osl 128
 """
 
 import argparse
@@ -79,6 +85,8 @@ class SweepPoint:
     isl: int
     osl: int
     results: List[RequestResult] = field(default_factory=list)
+    actual_wall_ms: float = 0  # measured externally with perf_counter
+    rounds: int = 1
 
     @property
     def successful(self) -> List[RequestResult]:
@@ -386,7 +394,156 @@ async def run_disagg_push_batch(
     return await asyncio.gather(*tasks)
 
 
-async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str = "push"):
+async def run_continuous_baseline(
+    session: aiohttp.ClientSession,
+    concurrency: int,
+    rounds: int,
+    prompts: List[str],
+    osl: int,
+) -> List[RequestResult]:
+    """Continuous baseline: send rounds*concurrency requests, max concurrency active at once."""
+    total = rounds * concurrency
+    sem = asyncio.Semaphore(concurrency)
+
+    async def do_one(req_id: int) -> RequestResult:
+        r = RequestResult(request_id=req_id)
+        async with sem:
+            t0 = time.perf_counter()
+            try:
+                async with session.post(f"{BASELINE_URL}/completion", json={
+                    "prompt": prompts[req_id % len(prompts)],
+                    "n_predict": osl,
+                    "cache_prompt": False,
+                    "temperature": 0.0,
+                }) as resp:
+                    if resp.status != 200:
+                        r.error = f"HTTP {resp.status}"
+                        r.total_ms = (time.perf_counter() - t0) * 1000
+                        return r
+                    data = await resp.json()
+            except Exception as e:
+                r.error = str(e)
+                r.total_ms = (time.perf_counter() - t0) * 1000
+                return r
+
+            r.total_ms = (time.perf_counter() - t0) * 1000
+            t = data.get("timings", {})
+            r.prefill_ms = t.get("prompt_ms", 0)
+            r.decode_ms = t.get("predicted_ms", 0)
+            r.tokens_generated = t.get("predicted_n", 0)
+            r.prompt_tokens = t.get("prompt_n", 0)
+            r.ttft_ms = r.prefill_ms
+            r.success = True
+            return r
+
+    tasks = [do_one(i) for i in range(total)]
+    return await asyncio.gather(*tasks)
+
+
+async def run_continuous_disagg_push(
+    session: aiohttp.ClientSession,
+    concurrency: int,
+    rounds: int,
+    prompts: List[str],
+    osl: int,
+) -> List[RequestResult]:
+    """Continuous pipelined disagg: prefill and decode use independent slot pools.
+
+    Key: prefill slot is released after push completes, so new prefills start
+    while previous requests are still decoding. This fills the pipeline.
+    """
+    total = rounds * concurrency
+
+    # Independent slot pools for prefill and decode GPUs
+    prefill_slots = asyncio.Queue()
+    decode_slots = asyncio.Queue()
+    for i in range(concurrency):
+        prefill_slots.put_nowait(i)
+        decode_slots.put_nowait(i)
+
+    async def do_one(req_id: int) -> RequestResult:
+        r = RequestResult(request_id=req_id)
+        prompt = prompts[req_id % len(prompts)]
+        pf_slot = None
+        dc_slot = None
+
+        t0 = time.perf_counter()
+        try:
+            # 1. Acquire prefill slot and prefill
+            pf_slot = await prefill_slots.get()
+            t_pf = time.perf_counter()
+            async with session.post(f"{PREFILL_URL}/completion", json={
+                "prompt": prompt,
+                "n_predict": 0,
+                "cache_prompt": False,
+                "id_slot": pf_slot,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Prefill HTTP {resp.status}: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                pf_data = await resp.json()
+            r.prefill_ms = (time.perf_counter() - t_pf) * 1000
+            r.prompt_tokens = pf_data.get("timings", {}).get("prompt_n", 0)
+
+            # 2. Acquire decode slot, then push from prefill slot to decode slot
+            dc_slot = await decode_slots.get()
+            t_push = time.perf_counter()
+            async with session.post(f"{PREFILL_URL}/slots/{pf_slot}/kv-data/push", json={
+                "target_url": DECODE_URL,
+                "target_slot": dc_slot,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Push failed: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                push_data = await resp.json()
+            push_ms = (time.perf_counter() - t_push) * 1000
+            push_timings = push_data.get("timings", {})
+            r.save_ms = push_timings.get("export_ms", 0)
+            r.transfer_ms = push_timings.get("transfer_ms", 0)
+            r.restore_ms = push_timings.get("import_ms", 0)
+
+            # 3. Release prefill slot — PIPELINE: next request can start prefilling!
+            prefill_slots.put_nowait(pf_slot)
+            pf_slot = None
+
+            r.ttft_ms = r.prefill_ms + push_ms
+
+            # 4. Decode on decode slot
+            t_dc = time.perf_counter()
+            async with session.post(f"{DECODE_URL}/completion", json={
+                "prompt": prompt,
+                "n_predict": osl,
+                "cache_prompt": True,
+                "id_slot": dc_slot,
+                "temperature": 0.0,
+            }) as resp:
+                if resp.status != 200:
+                    r.error = f"Decode failed: {(await resp.text())[:100]}"
+                    r.total_ms = (time.perf_counter() - t0) * 1000
+                    return r
+                dc_data = await resp.json()
+            r.decode_ms = (time.perf_counter() - t_dc) * 1000
+            r.tokens_generated = dc_data.get("timings", {}).get("predicted_n", 0)
+            r.success = True
+
+        except Exception as e:
+            r.error = str(e)
+        finally:
+            if pf_slot is not None:
+                prefill_slots.put_nowait(pf_slot)
+            if dc_slot is not None:
+                decode_slots.put_nowait(dc_slot)
+
+        r.total_ms = (time.perf_counter() - t0) * 1000
+        return r
+
+    tasks = [do_one(i) for i in range(total)]
+    return await asyncio.gather(*tasks)
+
+
+async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str = "push", rounds: int = 1):
     """Run the full concurrency sweep."""
 
     # Pre-generate unique prompts
@@ -405,10 +562,12 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str
             pass
 
         all_points: List[SweepPoint] = []
+        total_label = f" x {rounds} rounds" if rounds > 1 else ""
 
         for conc in concurrency_levels:
+            total_reqs = conc * rounds
             print(f"\n{'='*70}")
-            print(f"  Concurrency = {conc}  (ISL={isl}, OSL={osl})")
+            print(f"  Concurrency = {conc}{total_label}  (ISL={isl}, OSL={osl}, total={total_reqs})")
             print(f"{'='*70}")
 
             # Clear all slots
@@ -416,18 +575,22 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str
             await asyncio.sleep(1)
 
             # --- BASELINE ---
-            print(f"  Baseline (single GPU on Spark 1)...", end="", flush=True)
+            print(f"  Baseline (single GPU, {total_reqs} requests)...", end="", flush=True)
             t0 = time.perf_counter()
-            baseline_results = await run_baseline_batch(session, conc, prompts, osl)
+            if rounds > 1:
+                baseline_results = await run_continuous_baseline(session, conc, rounds, prompts, osl)
+            else:
+                baseline_results = await run_baseline_batch(session, conc, prompts, osl)
             baseline_wall = (time.perf_counter() - t0) * 1000
 
             bp = SweepPoint(concurrency=conc, mode="baseline", isl=isl, osl=osl,
-                           results=list(baseline_results))
+                           results=list(baseline_results), actual_wall_ms=baseline_wall,
+                           rounds=rounds)
             all_points.append(bp)
 
             ok = len(bp.successful)
-            fail = conc - ok
-            print(f" {ok}/{conc} ok, wall={baseline_wall:.0f}ms, "
+            fail = total_reqs - ok
+            print(f" {ok}/{total_reqs} ok, wall={baseline_wall:.0f}ms, "
                   f"avg={bp.avg_total_ms:.0f}ms, ttft={bp.avg_ttft_ms:.0f}ms")
             if fail > 0:
                 errors = [r.error for r in bp.results if not r.success]
@@ -438,22 +601,25 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str
             await asyncio.sleep(1)
 
             # --- DISAGG ---
-            disagg_label = "push" if mode == "push" else "SCP"
-            print(f"  Disagg [{disagg_label}] (prefill Spark1 + decode Spark2)...", end="", flush=True)
+            disagg_label = "push-pipeline" if (mode == "push" and rounds > 1) else ("push" if mode == "push" else "SCP")
+            print(f"  Disagg [{disagg_label}] ({total_reqs} requests)...", end="", flush=True)
             t0 = time.perf_counter()
-            if mode == "push":
+            if rounds > 1 and mode == "push":
+                disagg_results = await run_continuous_disagg_push(session, conc, rounds, prompts, osl)
+            elif mode == "push":
                 disagg_results = await run_disagg_push_batch(session, conc, prompts, osl)
             else:
                 disagg_results = await run_disagg_batch(session, conc, prompts, osl)
             disagg_wall = (time.perf_counter() - t0) * 1000
 
             dp = SweepPoint(concurrency=conc, mode="disagg", isl=isl, osl=osl,
-                           results=list(disagg_results))
+                           results=list(disagg_results), actual_wall_ms=disagg_wall,
+                           rounds=rounds)
             all_points.append(dp)
 
             ok = len(dp.successful)
-            fail = conc - ok
-            print(f" {ok}/{conc} ok, wall={disagg_wall:.0f}ms, "
+            fail = total_reqs - ok
+            print(f" {ok}/{total_reqs} ok, wall={disagg_wall:.0f}ms, "
                   f"avg={dp.avg_total_ms:.0f}ms, ttft={dp.avg_ttft_ms:.0f}ms")
             if fail > 0:
                 errors = [r.error for r in dp.results if not r.success]
@@ -483,15 +649,20 @@ async def run_sweep(concurrency_levels: List[int], isl: int, osl: int, mode: str
 def print_summary(points: List[SweepPoint]):
     """Print the sweep summary table."""
 
+    rounds = points[0].rounds if points else 1
+
     print("\n\n" + "=" * 110)
-    print("CONCURRENCY SWEEP RESULTS")
+    title = "CONTINUOUS PIPELINE RESULTS" if rounds > 1 else "CONCURRENCY SWEEP RESULTS"
+    print(title)
+    if rounds > 1:
+        print(f"({rounds} rounds per concurrency level)")
     print("=" * 110)
 
     conc_levels = sorted(set(p.concurrency for p in points))
 
-    # Main throughput table
-    print(f"\n{'Conc':>5} | {'--- Baseline (1 GPU) ---':^36} | {'--- Disagg (2 GPUs) ---':^36} | {'Decode':>8} {'Speedup':>8}")
-    print(f"{'':>5} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'Avg(ms)':>8} {'TTFT(ms)':>9} {'Tok/s':>8} {'Ok':>4}{'':>7} | {'TPS spdup':>8} {'':>8}")
+    # Main throughput table — use actual_wall_ms for accurate measurement
+    print(f"\n{'Conc':>5} {'Reqs':>5} | {'--- Baseline (1 GPU) ---':^36} | {'--- Disagg (2 GPUs) ---':^36} | {'Speedup':>8}")
+    print(f"{'':>5} {'':>5} | {'Wall(s)':>8} {'Req/s':>7} {'Tok/s':>8} {'Ok':>6}  | {'Wall(s)':>8} {'Req/s':>7} {'Tok/s':>8} {'Ok':>6}  | {'':>8}")
     print("-" * 110)
 
     for conc in conc_levels:
@@ -501,22 +672,44 @@ def print_summary(points: List[SweepPoint]):
         if not bp or not dp:
             continue
 
+        total_reqs = conc * rounds
         b_ok = len(bp.successful)
         d_ok = len(dp.successful)
         b_total_tok = sum(r.tokens_generated for r in bp.successful)
         d_total_tok = sum(r.tokens_generated for r in dp.successful)
-        b_wall = bp.wall_time_ms / 1000 if bp.wall_time_ms > 0 else 1
-        d_wall = dp.wall_time_ms / 1000 if dp.wall_time_ms > 0 else 1
-        b_tps = b_total_tok / b_wall
-        d_tps = d_total_tok / d_wall
+
+        # Use actual wall time (measured externally) for throughput
+        b_wall_s = bp.actual_wall_ms / 1000 if bp.actual_wall_ms > 0 else bp.wall_time_ms / 1000
+        d_wall_s = dp.actual_wall_ms / 1000 if dp.actual_wall_ms > 0 else dp.wall_time_ms / 1000
+        b_wall_s = max(b_wall_s, 0.001)
+        d_wall_s = max(d_wall_s, 0.001)
+
+        b_rps = b_ok / b_wall_s
+        d_rps = d_ok / d_wall_s
+        b_tps = b_total_tok / b_wall_s
+        d_tps = d_total_tok / d_wall_s
 
         speedup = d_tps / b_tps if b_tps > 0 else 0
 
-        print(f"{conc:>5} | {bp.avg_total_ms:>8.0f} {bp.avg_ttft_ms:>9.0f} {b_tps:>8.1f} {b_ok:>4}/{conc:<3}"
-              f" | {dp.avg_total_ms:>8.0f} {dp.avg_ttft_ms:>9.0f} {d_tps:>8.1f} {d_ok:>4}/{conc:<3}"
-              f" | {speedup:>8.2f}x")
+        print(f"{conc:>5} {total_reqs:>5} | {b_wall_s:>8.1f} {b_rps:>7.2f} {b_tps:>8.1f} {b_ok:>4}/{total_reqs:<3}"
+              f" | {d_wall_s:>8.1f} {d_rps:>7.2f} {d_tps:>8.1f} {d_ok:>4}/{total_reqs:<3}"
+              f" | {speedup:>7.2f}x")
 
     print("-" * 110)
+
+    # Latency table
+    print(f"\nLatency (ms):")
+    print(f"{'Conc':>5} | {'-- Baseline --':^24} | {'--- Disagg ---':^24}")
+    print(f"{'':>5} | {'Avg':>8} {'P50':>8} {'TTFT':>8} | {'Avg':>8} {'P50':>8} {'TTFT':>8}")
+    print("-" * 60)
+    for conc in conc_levels:
+        bp = next((p for p in points if p.concurrency == conc and p.mode == "baseline"), None)
+        dp = next((p for p in points if p.concurrency == conc and p.mode == "disagg"), None)
+        if not bp or not dp:
+            continue
+        print(f"{conc:>5} | {bp.avg_total_ms:>8.0f} {bp.p50_total_ms:>8.0f} {bp.avg_ttft_ms:>8.0f}"
+              f" | {dp.avg_total_ms:>8.0f} {dp.p50_total_ms:>8.0f} {dp.avg_ttft_ms:>8.0f}")
+    print("-" * 60)
 
     # Per-GPU TPS table
     print(f"\nPer-GPU Throughput (tokens/sec):")
@@ -531,21 +724,21 @@ def print_summary(points: List[SweepPoint]):
         if not bp or not dp or not bp.successful or not dp.successful:
             continue
 
-        b_wall = bp.wall_time_ms / 1000 if bp.wall_time_ms > 0 else 1
-        d_wall = dp.wall_time_ms / 1000 if dp.wall_time_ms > 0 else 1
+        b_wall = (bp.actual_wall_ms or bp.wall_time_ms) / 1000
+        d_wall = (dp.actual_wall_ms or dp.wall_time_ms) / 1000
+        b_wall = max(b_wall, 0.001)
+        d_wall = max(d_wall, 0.001)
 
-        # Baseline: 1 GPU does both prefill and decode
         b_prefill_tok = sum(r.prompt_tokens for r in bp.successful)
         b_decode_tok = sum(r.tokens_generated for r in bp.successful)
         b_pf_tps = b_prefill_tok / b_wall
         b_dc_tps = b_decode_tok / b_wall
         b_total_tps = (b_prefill_tok + b_decode_tok) / b_wall
 
-        # Disagg: GPU1 does prefill, GPU2 does decode (each is 1 GPU)
         d_prefill_tok = sum(r.prompt_tokens for r in dp.successful)
         d_decode_tok = sum(r.tokens_generated for r in dp.successful)
-        d_pf_tps = d_prefill_tok / d_wall  # per GPU (only 1 GPU doing prefill)
-        d_dc_tps = d_decode_tok / d_wall    # per GPU (only 1 GPU doing decode)
+        d_pf_tps = d_prefill_tok / d_wall
+        d_dc_tps = d_decode_tok / d_wall
         d_total_tps = (d_prefill_tok + d_decode_tok) / d_wall
 
         print(f"{conc:>5} | {b_pf_tps:>10.0f} {b_dc_tps:>10.1f} {b_total_tps:>10.0f}"
@@ -577,6 +770,8 @@ async def main():
     parser = argparse.ArgumentParser(description="Concurrency Sweep Benchmark")
     parser.add_argument("--concurrency", type=str, default="1,2",
                         help="Comma-separated concurrency levels")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="Rounds per concurrency level (>1 enables continuous pipeline mode)")
     parser.add_argument("--isl", type=int, default=2000, help="Input sequence length (tokens)")
     parser.add_argument("--osl", type=int, default=128, help="Output sequence length (tokens)")
     parser.add_argument("--mode", choices=["push", "scp"], default="push",
@@ -595,13 +790,18 @@ async def main():
         DECODE_URL = args.decode_url
 
     print("=" * 70)
-    print("CONCURRENCY SWEEP: Baseline vs Disaggregated")
+    if args.rounds > 1:
+        print(f"CONTINUOUS PIPELINE: Baseline vs Disaggregated ({args.rounds} rounds)")
+    else:
+        print("CONCURRENCY SWEEP: Baseline vs Disaggregated")
     print("=" * 70)
     print(f"ISL: {args.isl} tokens, OSL: {args.osl} tokens")
     print(f"Concurrency levels: {conc_levels}")
+    if args.rounds > 1:
+        print(f"Rounds: {args.rounds} (total requests per level: {[c*args.rounds for c in conc_levels]})")
     print(f"Baseline: {BASELINE_URL} (single GPU)")
     print(f"Disagg:   {PREFILL_URL} (prefill) + {DECODE_URL} (decode)")
-    print(f"Transfer: {args.mode}")
+    print(f"Transfer: {args.mode}{' (pipelined)' if args.rounds > 1 else ''}")
 
     # Check servers
     timeout = aiohttp.ClientTimeout(total=5)
@@ -616,7 +816,7 @@ async def main():
                 print(f"  FAIL: {name} at {url} - {e}")
                 return
 
-    points = await run_sweep(conc_levels, args.isl, args.osl, mode=args.mode)
+    points = await run_sweep(conc_levels, args.isl, args.osl, mode=args.mode, rounds=args.rounds)
     print_summary(points)
 
     # Save raw results
