@@ -1914,8 +1914,10 @@ private:
                     uint8_t * p = buffer->data();
 
                     // write header (same format as llama_state_seq_save_file)
-                    memcpy(p + 0, &(const uint32_t &)(uint32_t){LLAMA_STATE_SEQ_MAGIC},   4);
-                    memcpy(p + 4, &(const uint32_t &)(uint32_t){LLAMA_STATE_SEQ_VERSION},  4);
+                    const uint32_t magic_val   = LLAMA_STATE_SEQ_MAGIC;
+                    const uint32_t version_val = LLAMA_STATE_SEQ_VERSION;
+                    memcpy(p + 0, &magic_val,   4);
+                    memcpy(p + 4, &version_val,  4);
                     const uint32_t n_tok_u32 = (uint32_t)n_tokens;
                     memcpy(p + 8, &n_tok_u32, 4);
                     if (n_tokens > 0) {
