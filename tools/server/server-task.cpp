@@ -1432,6 +1432,34 @@ json server_task_result_slot_save_load::to_json() {
 }
 
 //
+// server_task_result_slot_export
+//
+json server_task_result_slot_export::to_json() {
+    return json {
+        { "id_slot",    id_slot },
+        { "n_tokens",   n_tokens },
+        { "n_kv_bytes", n_kv_bytes },
+        { "timings", {
+            { "export_ms", t_ms }
+        }},
+    };
+}
+
+//
+// server_task_result_slot_import
+//
+json server_task_result_slot_import::to_json() {
+    return json {
+        { "id_slot",    id_slot },
+        { "n_tokens",   n_tokens },
+        { "n_kv_bytes", n_kv_bytes },
+        { "timings", {
+            { "import_ms", t_ms }
+        }},
+    };
+}
+
+//
 // server_task_result_slot_erase
 //
 json server_task_result_slot_erase::to_json() {

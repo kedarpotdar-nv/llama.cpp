@@ -3,10 +3,12 @@
 #include "common.h"
 #include "llama.h"
 
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -24,6 +26,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER,
+    SERVER_TASK_TYPE_SLOT_IMPORT_BUFFER,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -136,11 +140,14 @@ struct server_task {
 
     server_task_type type;
 
-    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+    // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE,
+    //         SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER, SERVER_TASK_TYPE_SLOT_IMPORT_BUFFER
     struct slot_action {
         int slot_id;
         std::string filename;
         std::string filepath;
+        // for buffer-based KV transfer (export/import)
+        std::shared_ptr<std::vector<uint8_t>> kv_buffer;
     };
     slot_action slot_action;
 
@@ -509,6 +516,23 @@ struct server_task_result_slot_save_load : server_task_result {
 
     size_t n_tokens;
     size_t n_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_export : server_task_result {
+    std::shared_ptr<std::vector<uint8_t>> kv_buffer;
+    size_t n_tokens;
+    size_t n_kv_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_import : server_task_result {
+    size_t n_tokens;
+    size_t n_kv_bytes;
     double t_ms;
 
     virtual json to_json() override;

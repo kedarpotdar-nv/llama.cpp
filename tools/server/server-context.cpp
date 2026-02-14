@@ -1885,6 +1885,136 @@ private:
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER:
+                {
+                    if (!check_no_mtmd(task.id)) break;
+                    int id_slot = task.slot_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    const size_t kv_size = llama_state_seq_get_size(ctx, slot->id);
+                    const llama_tokens & tokens = slot->prompt.tokens.get_text_tokens();
+                    const size_t n_tokens = tokens.size();
+
+                    // header: magic(4) + version(4) + n_tokens(4) + tokens(n*4) + kv_data
+                    const size_t header_size = 12 + n_tokens * sizeof(llama_token);
+                    const size_t total_size = header_size + kv_size;
+
+                    auto buffer = std::make_shared<std::vector<uint8_t>>(total_size);
+                    uint8_t * p = buffer->data();
+
+                    // write header (same format as llama_state_seq_save_file)
+                    memcpy(p + 0, &(const uint32_t &)(uint32_t){LLAMA_STATE_SEQ_MAGIC},   4);
+                    memcpy(p + 4, &(const uint32_t &)(uint32_t){LLAMA_STATE_SEQ_VERSION},  4);
+                    const uint32_t n_tok_u32 = (uint32_t)n_tokens;
+                    memcpy(p + 8, &n_tok_u32, 4);
+                    if (n_tokens > 0) {
+                        memcpy(p + 12, tokens.data(), n_tokens * sizeof(llama_token));
+                    }
+
+                    // serialize KV cache state into buffer
+                    const size_t kv_written = llama_state_seq_get_data(ctx, p + header_size, kv_size, slot->id);
+                    if (kv_written == 0) {
+                        send_error(task, "Failed to export KV cache state", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    buffer->resize(header_size + kv_written);
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_slot_export>();
+                    res->id         = task.id;
+                    res->id_slot    = id_slot;
+                    res->kv_buffer  = buffer;
+                    res->n_tokens   = n_tokens;
+                    res->n_kv_bytes = kv_written;
+                    res->t_ms       = (t_end - t_start) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_IMPORT_BUFFER:
+                {
+                    if (!check_no_mtmd(task.id)) break;
+                    int id_slot = task.slot_action.slot_id;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    auto & buffer = task.slot_action.kv_buffer;
+                    const uint8_t * p = buffer->data();
+                    const size_t buf_size = buffer->size();
+
+                    if (buf_size < 12) {
+                        send_error(task, "KV buffer too small", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // validate header
+                    uint32_t magic, version, n_tok_u32;
+                    memcpy(&magic,    p + 0, 4);
+                    memcpy(&version,  p + 4, 4);
+                    memcpy(&n_tok_u32, p + 8, 4);
+
+                    if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+                        send_error(task, "Invalid KV buffer magic/version", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const size_t n_tokens = n_tok_u32;
+                    const size_t header_size = 12 + n_tokens * sizeof(llama_token);
+                    if (buf_size < header_size) {
+                        send_error(task, "KV buffer truncated (tokens section)", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // extract tokens
+                    llama_tokens tokens(n_tokens);
+                    if (n_tokens > 0) {
+                        memcpy(tokens.data(), p + 12, n_tokens * sizeof(llama_token));
+                    }
+
+                    // deserialize KV cache state
+                    const size_t kv_data_size = buf_size - header_size;
+                    const size_t nread = llama_state_seq_set_data(ctx, p + header_size, kv_data_size, slot->id);
+                    if (nread == 0) {
+                        slot->prompt.tokens.clear();
+                        send_error(task, "Failed to import KV cache state", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // update slot's prompt tokens
+                    slot->prompt.tokens.clear();
+                    slot->prompt.tokens.insert(tokens);
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_slot_import>();
+                    res->id         = task.id;
+                    res->id_slot    = id_slot;
+                    res->n_tokens   = n_tokens;
+                    res->n_kv_bytes = nread;
+                    res->t_ms       = (t_end - t_start) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     if (!check_no_mtmd(task.id)) {
@@ -3385,6 +3515,34 @@ void server_routes::init_routes() {
         }
     };
 
+    // KV cache buffer export/import endpoints for disaggregated inference
+    // these do NOT require --slot-save-path since they bypass the filesystem
+    this->get_slot_kv_data = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::string id_slot_str = req.get_param("id_slot");
+        int id_slot;
+        try {
+            id_slot = std::stoi(id_slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_slots_export_buffer(req, id_slot);
+    };
+
+    this->post_slot_kv_data = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::string id_slot_str = req.get_param("id_slot");
+        int id_slot;
+        try {
+            id_slot = std::stoi(id_slot_str);
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_slots_import_buffer(req, id_slot);
+    };
+
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
 
@@ -3986,6 +4144,75 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_export_buffer(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_EXPORT_BUFFER);
+        task.id = rd.get_new_id();
+        task.slot_action.slot_id = id_slot;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    auto * export_result = dynamic_cast<server_task_result_slot_export*>(result.get());
+    GGML_ASSERT(export_result != nullptr);
+
+    // return binary KV data directly
+    auto & buf = export_result->kv_buffer;
+    res->status = 200;
+    res->content_type = "application/octet-stream";
+    res->data.assign(reinterpret_cast<const char*>(buf->data()), buf->size());
+    res->headers["X-KV-Tokens"]       = std::to_string(export_result->n_tokens);
+    res->headers["X-KV-Bytes"]        = std::to_string(export_result->n_kv_bytes);
+    res->headers["X-KV-Serialize-Ms"] = std::to_string(export_result->t_ms);
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_import_buffer(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    if (req.body.empty()) {
+        res->error(format_error_response("Empty request body", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    // copy binary body into shared buffer
+    auto buffer = std::make_shared<std::vector<uint8_t>>(req.body.size());
+    memcpy(buffer->data(), req.body.data(), req.body.size());
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_IMPORT_BUFFER);
+        task.id = rd.get_new_id();
+        task.slot_action.slot_id = id_slot;
+        task.slot_action.kv_buffer = buffer;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
     res->ok(result->to_json());
     return res;
 }

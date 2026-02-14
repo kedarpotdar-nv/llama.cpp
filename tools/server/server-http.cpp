@@ -105,6 +105,9 @@ bool server_http_context::init(const common_params & params) {
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
 
+    // increase max payload size to 1GB for KV cache buffer transfer (disaggregated inference)
+    srv->set_payload_max_length(1024 * 1024 * 1024);
+
     if (params.api_keys.size() == 1) {
         auto key = params.api_keys[0];
         std::string substr = key.substr(std::max((int)(key.length() - 4), 0));
