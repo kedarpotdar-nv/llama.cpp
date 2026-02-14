@@ -22,6 +22,13 @@
 #include <memory>
 #include <filesystem>
 
+// for raw socket push transfer
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -4289,7 +4296,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_push(const ser
     SRV_INF("push: exported slot %d, %zu tokens, %zu KV bytes, %.2f ms\n",
             id_slot, n_tokens, n_kv_bytes, export_ms);
 
-    // Step 2: POST buffer directly to decode server
+    // Step 2: POST buffer directly to decode server using raw sockets for max throughput
     const int64_t t_transfer_start = ggml_time_us();
 
     // parse target URL to extract host and port
@@ -4316,35 +4323,111 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_push(const ser
         host.pop_back();
     }
 
-    httplib::Client cli(host, port);
-    cli.set_connection_timeout(5, 0); // 5 seconds
-    cli.set_read_timeout(300, 0);     // 5 minutes for large KV caches
-    cli.set_write_timeout(300, 0);
-
     const std::string push_path = "/slots/" + std::to_string(target_slot) + "/kv-data";
     auto & buf = export_result->kv_buffer;
 
-    auto http_result = cli.Post(
-        push_path,
-        reinterpret_cast<const char *>(buf->data()),
-        buf->size(),
-        "application/octet-stream"
-    );
+    // raw socket transfer for maximum throughput
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        res->error(format_error_response("Push failed: socket() error", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    // set socket options for high throughput
+    {
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        int sndbuf = 4 * 1024 * 1024; // 4MB send buffer (may be capped by wmem_max)
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        close(sock);
+        res->error(format_error_response("Push failed: invalid target host: " + host, ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(sock);
+        res->error(format_error_response("Push failed: connect() to " + host + ":" + std::to_string(port) + " error", ERROR_TYPE_SERVER));
+        return res;
+    }
+
+    // send HTTP POST headers
+    std::string http_header = "POST " + push_path + " HTTP/1.1\r\n"
+        "Host: " + host + ":" + std::to_string(port) + "\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: " + std::to_string(buf->size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    {
+        const char * p = http_header.data();
+        size_t remaining = http_header.size();
+        while (remaining > 0) {
+            ssize_t n = ::send(sock, p, remaining, 0);
+            if (n <= 0) {
+                close(sock);
+                res->error(format_error_response("Push failed: send headers error", ERROR_TYPE_SERVER));
+                return res;
+            }
+            p += n;
+            remaining -= n;
+        }
+    }
+
+    // send body in large chunks
+    {
+        const uint8_t * p = buf->data();
+        size_t remaining = buf->size();
+        while (remaining > 0) {
+            ssize_t n = ::send(sock, p, remaining, 0);
+            if (n <= 0) {
+                close(sock);
+                res->error(format_error_response("Push failed: send body error", ERROR_TYPE_SERVER));
+                return res;
+            }
+            p += n;
+            remaining -= n;
+        }
+    }
+
+    // read HTTP response (small — just JSON status + timing info)
+    std::string response_buf;
+    {
+        char tmp[8192];
+        ssize_t n;
+        while ((n = ::recv(sock, tmp, sizeof(tmp), 0)) > 0) {
+            response_buf.append(tmp, n);
+        }
+    }
+    close(sock);
 
     const int64_t t_transfer_end = ggml_time_us();
     const double transfer_ms = (t_transfer_end - t_transfer_start) / 1000.0;
 
-    if (!http_result) {
-        const std::string err_msg = "Push failed: HTTP request to " + target_url + push_path +
-                                    " failed: " + httplib::to_string(http_result.error());
-        SRV_ERR("%s\n", err_msg.c_str());
-        res->error(format_error_response(err_msg, ERROR_TYPE_SERVER));
-        return res;
+    // parse HTTP response status and body
+    int http_status = 0;
+    std::string http_body;
+    {
+        auto header_end = response_buf.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            std::string status_line = response_buf.substr(0, response_buf.find("\r\n"));
+            // parse "HTTP/1.1 200 OK"
+            auto space1 = status_line.find(' ');
+            if (space1 != std::string::npos) {
+                http_status = std::stoi(status_line.substr(space1 + 1));
+            }
+            http_body = response_buf.substr(header_end + 4);
+        }
     }
 
-    if (http_result->status != 200) {
+    if (http_status != 200) {
         const std::string err_msg = "Push failed: target returned HTTP " +
-                                    std::to_string(http_result->status) + ": " + http_result->body;
+                                    std::to_string(http_status) + ": " + http_body;
         SRV_ERR("%s\n", err_msg.c_str());
         res->error(format_error_response(err_msg, ERROR_TYPE_SERVER));
         return res;
@@ -4353,7 +4436,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_push(const ser
     // parse import timing from target's response
     double import_ms = 0.0;
     try {
-        json target_response = json::parse(http_result->body);
+        json target_response = json::parse(http_body);
         if (target_response.contains("timings") && target_response["timings"].contains("import_ms")) {
             import_ms = target_response["timings"]["import_ms"].get<double>();
         }
