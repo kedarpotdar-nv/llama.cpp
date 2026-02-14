@@ -84,6 +84,24 @@ The pipeline benefit increases with:
 - Multiple slots per server (`-np 4`)
 - Higher concurrency
 
+### Concurrency Sweep (ISL=4000, OSL=128, -np 16, -c 131072)
+
+| Concurrency | Baseline Tok/s | Disagg Tok/s | Speedup |
+|:-----------:|:--------------:|:------------:|:-------:|
+| 1 | 37.2 | 27.1 | 0.73x |
+| 2 | 52.3 | 44.3 | 0.85x |
+| 4 | 76.4 | 61.2 | 0.80x |
+| **8** | **78.1** | **90.6** | **1.16x** |
+| **12** | **92.6** | **109.1** | **1.18x** |
+| 16 | 117.2 | 121.7 | 1.04x |
+
+**Crossover at concurrency 8**: disagg overtakes baseline when the single GPU
+becomes saturated handling both prefill and decode. Peak advantage is 1.18x
+at concurrency 12.
+
+Trade-off: disagg has higher TTFT (time to first token) due to KV cache
+transfer overhead (~1.3s avg at high concurrency).
+
 ## File Structure
 
 | File | Purpose |
@@ -96,6 +114,7 @@ The pipeline benefit increases with:
 | `orchestrator.py` | HTTP orchestrator with SCP transfer |
 | `benchmark.py` | Baseline vs disagg latency comparison |
 | `pipeline_benchmark.py` | Pipeline throughput analysis |
+| `concurrency_sweep.py` | Concurrency sweep: find crossover point |
 
 ## Configuration
 
