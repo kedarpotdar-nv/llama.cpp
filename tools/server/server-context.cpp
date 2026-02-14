@@ -12,6 +12,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// increase httplib buffer sizes for high-throughput KV cache transfer
+#define CPPHTTPLIB_RECV_BUFSIZ size_t(1048576u) // 1 MB
+#define CPPHTTPLIB_SEND_BUFSIZ size_t(1048576u) // 1 MB
 #include <cpp-httplib/httplib.h>
 
 #include <cstddef>
