@@ -179,6 +179,24 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // Fused path: skip separate Q8_1 quantization, quantize inline per tile in the GEMM kernel.
+    // MXFP4 uses a different quantize format and cannot use the fused path.
+    if (!use_native_mxfp4) {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+
+        const mmq_args args = {
+            src0_d, src0->type, nullptr, ids_dst.get(), expert_bounds.get(), dst_d,
+            ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+            ne02, ne02, s02, 0, s2,
+            ne03, ne13, s03, 0, s3,
+            use_stream_k, ne12,
+            src1_d, ids_src1.get(), s11, ne10};
+
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        return;
+    }
+
+    // MXFP4 fallback: pre-quantize then launch GEMM (original path).
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -192,21 +210,14 @@ void ggml_cuda_mul_mat_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
 
-        if (use_native_mxfp4) {
-            quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
-        } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                   ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
-        }
+        quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const int64_t s12 = use_native_mxfp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (8 * QK_MXFP4 * sizeof(int)) :
-                                           ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s12 = ne11 * ne10_padded * sizeof(block_fp4_mmq) / (8 * QK_MXFP4 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,

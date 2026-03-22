@@ -93,6 +93,152 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     }
 }
 
+static __device__ __forceinline__ mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout_device(const ggml_type type_x) {
+    switch (type_x) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_Q5_0:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q5_1:
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q2_K:
+            return MMQ_Q8_1_DS_LAYOUT_D2S6;
+        case GGML_TYPE_Q3_K:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_IQ1_S:
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        default:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+    }
+}
+
+// Inline quantize 128 F32 values per column into block_q8_1_mmq format in shared memory.
+// Each warp handles one column, 32 lanes produce 128 int8 values (4 per lane) + scale/sum metadata.
+// Processes cols_per_batch = nwarps columns per iteration, looping over all mmq_x columns.
+template <int mmq_x>
+static __device__ __forceinline__ void quantize_tile_y_inline(
+        int * __restrict__ tile_y,
+        const float * __restrict__ src1_f32,
+        const int32_t * __restrict__ ids_src1,
+        const int64_t stride_src1,
+        const int col_start,
+        const int k_offset,
+        const int ne00,
+        const mmq_q8_1_ds_layout ds_layout) {
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = mmq_get_nwarps_device();
+
+    const int lane = threadIdx.x;
+
+    for (int j_batch = 0; j_batch < mmq_x; j_batch += nwarps) {
+        const int j = j_batch + threadIdx.y;
+
+        float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        if (j < mmq_x) {
+            const int j_global  = col_start + j;
+            const int src1_row  = ids_src1[j_global];
+            const int64_t k_idx = k_offset + lane * 4;
+
+            if (k_idx + 3 < ne00) {
+                xi = *((const float4 *)(src1_f32 + src1_row * stride_src1 + k_idx));
+            } else if (k_idx < ne00) {
+                const float * p = src1_f32 + src1_row * stride_src1 + k_idx;
+                xi.x = p[0];
+                xi.y = (k_idx + 1 < ne00) ? p[1] : 0.0f;
+                xi.z = (k_idx + 2 < ne00) ? p[2] : 0.0f;
+                xi.w = 0.0f;
+            }
+        }
+
+        // Compute amax within each scale group via warp shuffles.
+        // D4/DS4: 32 values per scale = 8 lanes, D2S6: 64 values per scale = 16 lanes.
+        float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            // 64 values per scale group = 16 lanes
+            #pragma unroll
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, warp_size));
+            }
+        } else {
+            // 32 values per scale group = 8 lanes
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, warp_size));
+            }
+        }
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        char4 q;
+        q.x = (int8_t)roundf(xi.x * d_inv);
+        q.y = (int8_t)roundf(xi.y * d_inv);
+        q.z = (int8_t)roundf(xi.z * d_inv);
+        q.w = (int8_t)roundf(xi.w * d_inv);
+
+        if (j >= mmq_x) {
+            continue;
+        }
+
+        // Write quantized int8 values: tile_y layout is [scales 4 ints][qs 32 ints] per column.
+        ((char4 *)(tile_y + j * MMQ_TILE_Y_K + 4))[lane] = q;
+
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+            // 1 float scale per 32 values, no partial sum
+            const int block_id = lane / 8;
+            if (lane % 8 == 0) {
+                ((float *)(tile_y + j * MMQ_TILE_Y_K))[block_id] = d;
+            }
+        } else if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            // 1 half2 (scale, sum) per 32 values
+            float sum = xi.x + xi.y + xi.z + xi.w;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, warp_size);
+            }
+            const int block_id = lane / 8;
+            if (lane % 8 == 0) {
+                ((half2 *)(tile_y + j * MMQ_TILE_Y_K))[block_id] = make_half2(__float2half(d), __float2half(sum));
+            }
+        } else {
+            // D2S6: 1 half scale per 64 values + 1 half sum per 16 values (first 96 values only)
+            float sum = xi.x + xi.y + xi.z + xi.w;
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, warp_size);
+            }
+            const int sum_group = lane / 4;
+            if (lane % 4 == 0 && sum_group < 6) {
+                ((half *)(tile_y + j * MMQ_TILE_Y_K))[2 + sum_group] = __float2half(sum);
+            }
+            const int scale_group = lane / 16;
+            if (lane % 16 == 0) {
+                ((half *)(tile_y + j * MMQ_TILE_Y_K))[scale_group] = __float2half(d);
+            }
+        }
+    }
+}
+
 struct tile_x_sizes {
     int qs;
     int dm;
@@ -3370,7 +3516,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const float * __restrict__ src1_f32 = nullptr,
+        const int32_t * __restrict__ fused_ids_src1 = nullptr,
+        const int64_t fused_stride_src1 = 0,
+        const int fused_col_start = 0,
+        const int fused_ne00 = 0) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3391,7 +3542,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks
     constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4 : 4 * QK8_1;
 #else
     constexpr int ne_block = 4 * QK8_1;
@@ -3404,9 +3554,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    const mmq_q8_1_ds_layout ds_layout = src1_f32 ? mmq_get_q8_1_ds_layout_device(type) : MMQ_Q8_1_DS_LAYOUT_D4;
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
+
+        if (src1_f32) {
+            const int k_off = (kb0 * qk / ne_block) * ne_block;
+            quantize_tile_y_inline<mmq_x>(tile_y, src1_f32, fused_ids_src1,
+                fused_stride_src1, fused_col_start, k_off, fused_ne00, ds_layout);
+        } else {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -3422,7 +3579,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        {
+        if (src1_f32) {
+            const int k_off = (kb0 * qk / ne_block) * ne_block + ne_block;
+            quantize_tile_y_inline<mmq_x>(tile_y, src1_f32, fused_ids_src1,
+                fused_stride_src1, fused_col_start, k_off, fused_ne00, ds_layout);
+        } else {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -3467,7 +3628,9 @@ static __global__ void mul_mat_q(
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int channel_ratio, const int nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ncols_max) {
+        const int ncols_max,
+        const float * __restrict__ fused_src1_f32, const int32_t * __restrict__ fused_ids_src1,
+        const int64_t fused_stride_src1, const int fused_ne00) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3552,7 +3715,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk);
+             tile_x_max_i, tile_y_max_j, 0, ncols_x/qk,
+             fused_src1_f32, fused_ids_src1, fused_stride_src1, col_low + jt*mmq_x, fused_ne00);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3632,7 +3796,8 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+             fused_src1_f32, fused_ids_src1, fused_stride_src1, col_low + jt*mmq_x, fused_ne00);
 
         kbc += blocks_per_ne00;
         kbc -= kbc % blocks_per_ne00;
@@ -3699,7 +3864,8 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
+         fused_src1_f32, fused_ids_src1, fused_stride_src1, col_low + jt*mmq_x, fused_ne00);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -3870,6 +4036,8 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    const float * src1_f32 = nullptr; const int32_t * fused_ids_src1 = nullptr;
+    int64_t fused_stride_src1 = 0; int64_t fused_ne00 = 0;
 };
 
 template<ggml_type type>
@@ -3916,7 +4084,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+                 args.ncols_max,
+                 args.src1_f32, args.fused_ids_src1, args.fused_stride_src1, args.fused_ne00);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -3924,7 +4093,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 args.ncols_max);
+                 args.ncols_max,
+                 args.src1_f32, args.fused_ids_src1, args.fused_stride_src1, args.fused_ne00);
         }
         return;
     }
@@ -3945,7 +4115,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+             args.ncols_max,
+             args.src1_f32, args.fused_ids_src1, args.fused_stride_src1, args.fused_ne00);
 
         if (!fixup_needed) {
             return;
@@ -3962,7 +4133,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
+             args.ncols_max,
+             args.src1_f32, args.fused_ids_src1, args.fused_stride_src1, args.fused_ne00);
 
         if (!fixup_needed) {
             return;
