@@ -2369,11 +2369,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
 
-    // Fallback path: uses GPU-side sorting via mm_ids_helper + cuBLAS per expert.
+    // Fallback path: uses GPU-side sorting via mm_ids_helper (both quantized and FP16/BF16).
     // Still requires a small D2H sync for expert_bounds, so not CUDA-graph compatible.
-    // But much faster than the old fallback: GPU-side sort, no fake tensor overhead.
+    // Improvement over old fallback: GPU-side sort replaces CPU-side sort + large D2H copy.
+    // For FP16/BF16: uses cuBLAS per expert (fast, direct).
+    // For quantized: uses ggml_cuda_mul_mat per expert (dispatches to MMQ which handles dequant).
     cudaStream_t stream = ctx.stream();
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
 
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -2381,19 +2382,21 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t n_tokens      = ne12;
     const int64_t n_experts     = ne02;
-    const int64_t cols          = ne00; // input dimension (K for cuBLAS)
-    const int64_t rows          = ne01; // output dimension (M for cuBLAS)
+    const int64_t cols          = ne00;
+    const int64_t rows          = ne01;
     const int64_t ne_total      = n_tokens * n_expert_used;
 
-    const bool use_f16 = src0->type == GGML_TYPE_F16 && fast_fp16_hardware_available(cc);
+    const bool is_quantized = ggml_is_quantized(src0->type);
+    const bool use_f16  = src0->type == GGML_TYPE_F16 && fast_fp16_hardware_available(cc);
     const bool use_bf16 = src0->type == GGML_TYPE_BF16;
 
-    const ggml_type type_src1_sorted = (use_f16 || use_bf16) ? src0->type : GGML_TYPE_F32;
+    // Determine the type for sorted src1: match src0 for FP16/BF16, else F32.
+    const ggml_type type_src1_sorted = (!is_quantized && (use_f16 || use_bf16)) ? src0->type : GGML_TYPE_F32;
     const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
 
     // Step 1: GPU-side sorting using mm_ids_helper
     const int si1  = ids->nb[1] / sizeof(int32_t);
-    const int sis1 = ne11; // n_expert_used
+    const int sis1 = ne11;
     const int nchannels_y = ne11;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1_dev(ctx.pool(), ne_total);
@@ -2410,7 +2413,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (n_experts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Step 3: Gather src1 rows (sorted by expert) and convert type if needed
+    // Step 3: Gather src1 rows (sorted by expert)
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne_total * cols * ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne_total * rows * sizeof(float));
 
@@ -2420,54 +2423,107 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         cols*ts_src1_sorted, ne_total*cols*ts_src1_sorted, ne_total*cols*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    // Step 4: cuBLAS GEMM per expert
-    // C = A^T @ B where A=[cols, rows] (expert weight), B=[cols, n_tokens_expert] (gathered input)
-    // cuBLAS: m=rows, n=n_tokens_expert, k=cols
-    cudaDataType_t cu_type_a, cu_type_b, cu_type_c;
-    cublasComputeType_t cu_compute;
+    // Step 4: Per-expert GEMM
+    if (!is_quantized) {
+        // FP16/BF16/F32 path: cuBLAS directly on the native weight format.
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
 
-    if (use_f16) {
-        cu_type_a = CUDA_R_16F;
-        cu_type_b = CUDA_R_16F;
-    } else if (use_bf16) {
-        cu_type_a = CUDA_R_16BF;
-        cu_type_b = CUDA_R_16BF;
-    } else {
-        cu_type_a = CUDA_R_32F;
-        cu_type_b = CUDA_R_32F;
-    }
-    cu_type_c  = CUDA_R_32F;
-    cu_compute = CUBLAS_COMPUTE_32F;
-
-    const float alpha_f = 1.0f;
-    const float beta_f  = 0.0f;
-
-    const int64_t lda = nb01 / ggml_type_size(src0->type); // cols (contiguous weight rows)
-    const int64_t ldb = cols;
-    const int64_t ldc = rows;
-
-    for (int64_t i = 0; i < n_experts; i++) {
-        const int32_t start = expert_bounds_host[i];
-        const int32_t end   = expert_bounds_host[i + 1];
-        const int32_t n_tokens_expert = end - start;
-        if (n_tokens_expert == 0) {
-            continue;
+        cudaDataType_t cu_type_a, cu_type_b;
+        if (use_f16) {
+            cu_type_a = CUDA_R_16F;
+            cu_type_b = CUDA_R_16F;
+        } else if (use_bf16) {
+            cu_type_a = CUDA_R_16BF;
+            cu_type_b = CUDA_R_16BF;
+        } else {
+            cu_type_a = CUDA_R_32F;
+            cu_type_b = CUDA_R_32F;
         }
 
-        const void * A = (const char *)src0->data + i * nb02;
-        const void * B = (const char *)src1_sorted.ptr + start * cols * ts_src1_sorted;
-        void       * C = (char *)dst_sorted.ptr + start * rows * sizeof(float);
+        const float alpha_f = 1.0f;
+        const float beta_f  = 0.0f;
+        const int64_t lda = nb01 / ggml_type_size(src0->type);
+        const int64_t ldb = cols;
+        const int64_t ldc = rows;
 
-        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            rows, n_tokens_expert, cols,
-            &alpha_f,
-            A, cu_type_a, lda,
-            B, cu_type_b, ldb,
-            &beta_f,
-            C, cu_type_c, ldc,
-            cu_compute,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        for (int64_t i = 0; i < n_experts; i++) {
+            const int32_t start = expert_bounds_host[i];
+            const int32_t end   = expert_bounds_host[i + 1];
+            const int32_t n_tokens_expert = end - start;
+            if (n_tokens_expert == 0) {
+                continue;
+            }
+
+            const void * A = (const char *)src0->data + i * nb02;
+            const void * B = (const char *)src1_sorted.ptr + start * cols * ts_src1_sorted;
+            void       * C = (char *)dst_sorted.ptr + start * rows * sizeof(float);
+
+            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                rows, n_tokens_expert, cols,
+                &alpha_f,
+                A, cu_type_a, lda,
+                B, cu_type_b, ldb,
+                &beta_f,
+                C, CUDA_R_32F, ldc,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+    } else {
+        // Quantized path: cuBLAS cannot handle GGML quant formats.
+        // Use ggml_cuda_mul_mat which dispatches to MMQ/dequant kernels.
+        char * src1_data_cur = (char *) src1_sorted.ptr;
+        char *  dst_data_cur = (char *)  dst_sorted.ptr;
+
+        for (int64_t i = 0; i < n_experts; i++) {
+            const int32_t start = expert_bounds_host[i];
+            const int32_t end   = expert_bounds_host[i + 1];
+            const int32_t n_tokens_expert = end - start;
+            if (n_tokens_expert == 0) {
+                continue;
+            }
+
+            ggml_tensor src0_slice = *src0;
+            src0_slice.ne[2]    = 1;
+            src0_slice.nb[3]    = src0_slice.nb[2];
+            src0_slice.op       = GGML_OP_VIEW;
+            src0_slice.view_src = dst->src[0];
+            src0_slice.data     = (char *) src0->data + i * nb02;
+
+            ggml_tensor src1_slice;
+            memset(&src1_slice, 0, sizeof(src1_slice));
+            src1_slice.buffer = src1->buffer;
+            src1_slice.type   = type_src1_sorted;
+            src1_slice.ne[0]  = cols;
+            src1_slice.ne[1]  = n_tokens_expert;
+            src1_slice.ne[2]  = 1;
+            src1_slice.ne[3]  = 1;
+            src1_slice.nb[0]  = ts_src1_sorted;
+            src1_slice.nb[1]  = cols * ts_src1_sorted;
+            src1_slice.nb[2]  = n_tokens_expert * cols * ts_src1_sorted;
+            src1_slice.nb[3]  = src1_slice.nb[2];
+            src1_slice.data   = src1_data_cur;
+
+            ggml_tensor dst_slice;
+            memset(&dst_slice, 0, sizeof(dst_slice));
+            dst_slice.buffer = dst->buffer;
+            dst_slice.type   = GGML_TYPE_F32;
+            dst_slice.ne[0]  = rows;
+            dst_slice.ne[1]  = n_tokens_expert;
+            dst_slice.ne[2]  = 1;
+            dst_slice.ne[3]  = 1;
+            dst_slice.nb[0]  = sizeof(float);
+            dst_slice.nb[1]  = rows * sizeof(float);
+            dst_slice.nb[2]  = n_tokens_expert * rows * sizeof(float);
+            dst_slice.nb[3]  = dst_slice.nb[2];
+            dst_slice.data   = dst_data_cur;
+
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+            CUDA_CHECK(cudaGetLastError());
+
+            src1_data_cur += n_tokens_expert * cols * ts_src1_sorted;
+            dst_data_cur  += n_tokens_expert * rows * sizeof(float);
+        }
     }
 
     // Step 5: Scatter results back to dst.
